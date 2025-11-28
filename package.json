@@ -5,6 +5,7 @@
   "private": true,
   "main": "src/server.ts",
   "scripts": {
+    "test": "vitest",
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
     "build": "echo 'Bun handles builds — no emit required'",
     "start": "node src/server.ts",
@@ -35,7 +36,8 @@
     "@types/express": "^5.0.5",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^24.10.1",
-    "ts-node-dev": "^2.0.0"
+    "ts-node-dev": "^2.0.0",
+    "vitest": "^4.0.14"
   },
   "peerDependencies": {
     "typescript": "^5.9.3"

@@ -2,7 +2,7 @@
 import express from "express";
 import pino from "pino";
 import pinoHttp from "pino-http";
-
+import { rateLimiter } from "./middleware/rateLimiter.js";
 import { errorHandler } from "./middleware/errorHandler.js";
 import uploadRoutes from "./routes/upload/index.js";
 import farmRoutes from "./routes/farm/index.js";
@@ -24,7 +24,7 @@ app.use(
     autoLogging: true
   })
 );
-
+app.use(rateLimiter({ windowMs: 60_000, max: 120 }));
 // Register routes
 app.use("/api/auth", authRoutes);
 app.use("/api/upload", uploadRoutes);
