@@ -32,6 +32,8 @@
     /* Path aliases (for clean imports) */
     "baseUrl": "./src",
     "paths": {
+      "@lib/*": ["lib/*"],
+      "@prisma/client": ["generated/prisma"],
       "@config/*": ["config/*"],
       "@routes/*": ["routes/*"],
       "@controllers/*": ["controllers/*"],

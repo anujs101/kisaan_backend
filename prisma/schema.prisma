@@ -4,11 +4,297 @@
 // Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
 // Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
 
+// generator client {
+//   provider = "prisma-client"
+//   output   = "../generated/prisma"
+// }
+
+// datasource db {
+//   provider = "postgresql"
+// }
+//------------------------------------------------------------
+
+// prisma/schema.prisma
+// Production-ready Prisma schema for Neon + PostGIS
+// - Set DATABASE_URL in env
+// - Note: geom uses Unsupported because Prisma doesn't have PostGIS types
+
 generator client {
-  provider = "prisma-client"
-  output   = "../generated/prisma"
+  provider        = "prisma-client-js"
+  //output   = "../generated/prisma"
 }
 
 datasource db {
   provider = "postgresql"
+}
+
+// Enums
+enum UploadStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  PROCESSING
+}
+
+enum VerificationStatus {
+  PENDING
+  VERIFIED
+  LOW_CONFIDENCE
+  UNVERIFIED
+  FLAGGED
+  REJECTED
+}
+
+enum ReviewStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  NEEDS_MORE_INFO
+}
+
+// Users
+model User {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email     String?  @unique
+  fullName  String?  @map("full_name")
+  role      String?
+  phone     String?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  uploads        Upload[]       @relation("user_uploads")
+  images         Image[]        @relation("user_images")
+  reviews        ImageReview[]  @relation("user_reviews")
+  damageCases    DamageCase[]   @relation("user_damage_cases")
+
+  @@map("users")
+}
+
+/*
+ * Uploads - transient / idempotency table created at presign
+ */
+model Upload {
+  id                 String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId             String?       @db.Uuid
+  user               User?         @relation(fields: [userId], references: [id], name: "user_uploads")
+  localUploadId      String        @db.Uuid                       @map("local_upload_id")
+  filename           String?
+  filesize           BigInt?       @db.BigInt
+  hasCaptureCoords   Boolean?      @map("has_capture_coords")
+  signedParams       Json?         @map("signed_params")
+  cloudinaryPublicId String?       @map("cloudinary_public_id")
+  uploadStatus       UploadStatus? @map("upload_status")
+  deviceMeta         Json?         @map("device_meta")           // { deviceId, appVersion, os, ua }
+  createdAt          DateTime      @default(now())               @map("created_at")
+  updatedAt          DateTime      @updatedAt                   @map("updated_at")
+
+  images             Image[]       @relation("upload_images")
+
+  @@index([userId], map: "idx_uploads_user_id")
+  @@unique([localUploadId], map: "ux_uploads_local_upload_id")
+  @@map("uploads")
+}
+
+/*
+ * Images - canonical records after verification
+ * Note: geom is Unsupported (PostGIS). Use raw SQL migrations to create/maintain geom and GIST index.
+ */
+model Image {
+  id                    String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+  userId                String?            @db.Uuid
+  user                  User?              @relation(fields: [userId], references: [id], name: "user_images")
+
+  uploadId              String?            @db.Uuid
+  upload                Upload?            @relation(fields: [uploadId], references: [id], name: "upload_images")
+
+  localUploadId         String             @db.Uuid                               @map("local_upload_id")
+  cloudinaryPublicId    String             @map("cloudinary_public_id")
+  storageUrl            String             @map("storage_url")
+  thumbnailUrl          String?            @map("thumbnail_url")
+
+  exif                  Json                                                   // raw exif JSON
+  exifLat               Float?             @map("exif_lat")
+  exifLon               Float?             @map("exif_lon")
+  exifTimestamp         DateTime?          @map("exif_timestamp")
+
+  captureLat            Float?             @map("capture_lat")
+  captureLon            Float?             @map("capture_lon")
+  captureTimestamp      DateTime?          @map("capture_timestamp")
+
+  uploadLat             Float?             @map("upload_lat")
+  uploadLon             Float?             @map("upload_lon")
+  uploadTimestamp       DateTime?          @map("upload_timestamp")
+
+  state                 String?
+  district              String?
+  block                 String?
+  village               String?
+
+  // detected relations
+  detectedCropId        String?            @db.Uuid                              @map("detected_crop_id")
+  detectedCrop          Crop?              @relation(fields: [detectedCropId], references: [id], name: "image_detected_crop")
+  detectedStageId       String?            @db.Uuid                              @map("detected_stage_id")
+  detectedStage         GrowthStage?       @relation(fields: [detectedStageId], references: [id], name: "image_detected_stage")
+
+  qualityScore          Float?             @map("quality_score")
+  imageHash             String?            @unique                               @map("image_hash") // sha256 of bytes
+
+  // PostGIS geography point  (Unsupported in Prisma - use raw SQL migrations & raw queries to set/create this)
+  geom                  Unsupported("geography(Point,4326)")
+
+  verificationStatus    VerificationStatus @default(PENDING)                    @map("verification_status")
+  verificationReason    String?            @map("verification_reason")
+  verificationDistanceM Float?             @map("verification_distance_m")
+
+  createdAt             DateTime           @default(now())                        @map("created_at")
+
+  analytics             ImageAnalytics[]
+  reviews               ImageReview[]
+  damageCaseImages      DamageCaseImage[]
+
+  @@index([verificationStatus, createdAt], map: "idx_images_status_created_at")
+  @@index([state, district], map: "idx_images_state_district")
+  @@index([detectedCropId], map: "idx_images_detected_crop")
+  @@unique([localUploadId], map: "ux_images_local_upload_id")
+  @@map("images")
+}
+
+/*
+ * Image analytics - ML outputs
+ */
+model ImageAnalytics {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  imageId      String   @db.Uuid
+  image        Image    @relation(fields: [imageId], references: [id])
+  modelName    String?  @map("model_name")
+  modelVersion String?  @map("model_version")
+  results      Json
+  qualityScore Float?   @map("quality_score")
+  processedAt  DateTime @default(now()) @map("processed_at")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  @@index([imageId], map: "idx_image_analytics_image_id")
+  @@index([processedAt], map: "idx_image_analytics_processed_at")
+  @@map("image_analytics")
+}
+
+/*
+ * Image review / human moderation
+ */
+model ImageReview {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  imageId    String   @db.Uuid
+  image      Image    @relation(fields: [imageId], references: [id])
+  reviewerId String?  @db.Uuid
+  reviewer   User?    @relation(fields: [reviewerId], references: [id], name: "user_reviews")
+
+  status     ReviewStatus? @map("status")
+  reason     String?
+  notes      String?
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@index([imageId], map: "idx_image_reviews_image_id")
+  @@index([status], map: "idx_image_reviews_status")
+  @@map("image_reviews")
+}
+
+/*
+ * Crops and growth stages
+ */
+model Crop {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name      String
+  code      String?  @unique
+  seasons   String[] @default([])
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  stages    GrowthStage[] @relation("crop_stages")
+  images    Image[]       @relation("image_detected_crop")
+
+  damageCases DamageCase[] @relation("crop_damage_cases")
+
+  @@map("crops")
+}
+
+
+model GrowthStage {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  cropId     String   @db.Uuid
+  crop       Crop     @relation(fields: [cropId], references: [id], name: "crop_stages")
+  name       String?
+  stageOrder Int?     @map("stage_order")
+  description String?
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  images     Image[]  @relation("image_detected_stage")
+
+  @@unique([cropId, stageOrder], map: "ux_growth_stage_crop_order")
+  @@map("growth_stages")
+}
+
+/*
+ * Damage classification and cases
+ */
+model DamageCategory {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name           String?
+  code           String?  @unique
+  defaultSeverity String? @map("default_severity")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  @@map("damage_categories")
+}
+
+model DamageCase {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  createdBy      String?  @db.Uuid @map("created_by")
+  createdByUser  User?    @relation(fields: [createdBy], references: [id], name: "user_damage_cases")
+  regionState    String?  @map("region_state")
+  regionDistrict String?  @map("region_district")
+  summary        String?
+  cropId         String?  @db.Uuid
+  // name the relation so it matches Crop
+  crop           Crop?    @relation(fields: [cropId], references: [id], name: "crop_damage_cases")
+  severity       String?
+  status         String?  @default("open")
+  estimatedAreaHa Float?  @map("estimated_area_ha")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  images         DamageCaseImage[]
+
+  @@index([regionState, regionDistrict], map: "idx_damage_cases_region")
+  @@index([status], map: "idx_damage_cases_status")
+  @@map("damage_cases")
+}
+
+
+model DamageCaseImage {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  damageCaseId String   @db.Uuid @map("damage_case_id")
+  damageCase   DamageCase @relation(fields: [damageCaseId], references: [id])
+  imageId      String   @db.Uuid
+  image        Image    @relation(fields: [imageId], references: [id])
+
+  @@index([damageCaseId], map: "idx_damage_case_images_case")
+  @@map("damage_case_images")
+}
+
+/*
+ * Audit logs - append only
+ */
+model AuditLog {
+  id        BigInt   @id @default(autoincrement()) @db.BigInt
+  eventType String   @map("event_type")
+  userId    String?  @db.Uuid
+  relatedId String?  @db.Uuid @map("related_id")
+  payload   Json?
+  ip        String?  @db.Inet
+  userAgent String?  @map("user_agent")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([relatedId], map: "idx_audit_logs_related")
+  @@index([createdAt], map: "idx_audit_logs_time")
+  @@map("audit_logs")
 }
