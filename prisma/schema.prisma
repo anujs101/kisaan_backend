@@ -18,17 +18,18 @@
 // Production-ready Prisma schema for Neon + PostGIS
 // - Set DATABASE_URL in env
 // - Note: geom uses Unsupported because Prisma doesn't have PostGIS types
-
 generator client {
-  provider        = "prisma-client-js"
-  //output   = "../generated/prisma"
+  provider = "prisma-client-js"
 }
 
 datasource db {
   provider = "postgresql"
 }
 
-// Enums
+// ------------------------
+// ENUMS
+// ------------------------
+
 enum UploadStatus {
   PENDING
   COMPLETED
@@ -52,15 +53,30 @@ enum ReviewStatus {
   NEEDS_MORE_INFO
 }
 
-// Users
-model User {
-  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  email     String?  @unique
-  fullName  String?  @map("full_name")
-  role      String?
-  phone     String?
-  createdAt DateTime @default(now()) @map("created_at")
+// ------------------------
+// USER + AUTH MODELS
+// ------------------------
 
+model User {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+  phone          String   @unique
+  phoneVerified  Boolean  @default(false) @map("phone_verified")
+
+  email          String?  @unique
+  emailVerified  Boolean  @default(false) @map("email_verified")
+
+  fullName       String?  @map("full_name")
+  role           String?
+
+  // Local auth
+  passwordHash   String?  @map("password_hash")
+
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt      @map("updated_at")
+
+  // Relations (inverse/list sides)
+  refreshTokens  RefreshToken[] @relation("user_refresh_tokens")
   uploads        Upload[]       @relation("user_uploads")
   images         Image[]        @relation("user_images")
   reviews        ImageReview[]  @relation("user_reviews")
@@ -70,22 +86,96 @@ model User {
 }
 
 /*
- * Uploads - transient / idempotency table created at presign
+ * Refresh tokens (child side defines relation + referential action)
  */
+model RefreshToken {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+  userId     String   @db.Uuid
+  user       User     @relation(fields: [userId], references: [id], name: "user_refresh_tokens", onDelete: Cascade)
+
+  tokenHash  String   @map("token_hash")
+  userAgent  String?  @map("user_agent")
+  ip         String?  @db.Inet
+  expiresAt  DateTime @map("expires_at")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@index([userId], map: "idx_refresh_tokens_user_id")
+  @@map("refresh_tokens")
+}
+
+/*
+ * AuthSession — temporary session created after /auth/request-otp
+ * (list side must NOT specify onDelete; child side will)
+ */
+model AuthSession {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  phone       String
+  purpose     String
+  metadata    Json?
+  clientNonce String?
+  requestIp   String?   @map("request_ip")
+  userAgent   String?   @map("user_agent")
+  expiresAt   DateTime  @map("expires_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  phoneOtps   PhoneOtp[] @relation("authsession_phone_otps")
+
+  @@index([phone, purpose], map: "idx_authsession_phone_purpose")
+  @@map("auth_sessions")
+}
+
+/*
+ * PhoneOtp — single OTP attempt, tied to sessionId
+ * Using Twilio Verify: do NOT store plaintext codes. Store provider meta instead.
+ * This is the child side of the authSession relation and can specify onDelete.
+ */
+model PhoneOtp {
+  id               String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+  phone            String
+  purpose          String
+
+  attempts         Int      @default(0)
+  used             Boolean  @default(false)
+
+  expiresAt        DateTime @map("expires_at")
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  // Twilio provider fields
+  provider         String?   @map("provider")          // e.g., 'twilio'
+  providerMeta     Json?     @map("provider_meta")
+  messageSid       String?   @map("message_sid")
+  verificationSid  String?   @map("verification_sid")
+
+  authSessionId    String?   @db.Uuid @map("auth_session_id")
+  authSession      AuthSession? @relation(fields: [authSessionId], references: [id], name: "authsession_phone_otps", onDelete: Cascade)
+
+  @@index([phone, purpose], map: "idx_phoneotp_phone_purpose")
+  @@index([expiresAt], map: "idx_phoneotp_expires_at")
+  @@map("phone_otps")
+}
+
+// ------------------------
+// UPLOADS / IMAGES
+// ------------------------
+
 model Upload {
   id                 String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
   userId             String?       @db.Uuid
-  user               User?         @relation(fields: [userId], references: [id], name: "user_uploads")
-  localUploadId      String        @db.Uuid                       @map("local_upload_id")
+  user               User?         @relation(fields: [userId], references: [id], name: "user_uploads", onDelete: SetNull)
+
+  localUploadId      String        @db.Uuid @map("local_upload_id")
   filename           String?
   filesize           BigInt?       @db.BigInt
   hasCaptureCoords   Boolean?      @map("has_capture_coords")
   signedParams       Json?         @map("signed_params")
   cloudinaryPublicId String?       @map("cloudinary_public_id")
   uploadStatus       UploadStatus? @map("upload_status")
-  deviceMeta         Json?         @map("device_meta")           // { deviceId, appVersion, os, ua }
-  createdAt          DateTime      @default(now())               @map("created_at")
-  updatedAt          DateTime      @updatedAt                   @map("updated_at")
+  deviceMeta         Json?         @map("device_meta")
+  createdAt          DateTime      @default(now()) @map("created_at")
+  updatedAt          DateTime      @updatedAt       @map("updated_at")
 
   images             Image[]       @relation("upload_images")
 
@@ -94,59 +184,54 @@ model Upload {
   @@map("uploads")
 }
 
-/*
- * Images - canonical records after verification
- * Note: geom is Unsupported (PostGIS). Use raw SQL migrations to create/maintain geom and GIST index.
- */
 model Image {
-  id                    String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  id                    String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
 
-  userId                String?            @db.Uuid
-  user                  User?              @relation(fields: [userId], references: [id], name: "user_images")
+  userId                String?  @db.Uuid
+  user                  User?    @relation(fields: [userId], references: [id], name: "user_images", onDelete: SetNull)
 
-  uploadId              String?            @db.Uuid
-  upload                Upload?            @relation(fields: [uploadId], references: [id], name: "upload_images")
+  uploadId              String?  @db.Uuid
+  upload                Upload?  @relation(fields: [uploadId], references: [id], name: "upload_images")
 
-  localUploadId         String             @db.Uuid                               @map("local_upload_id")
-  cloudinaryPublicId    String             @map("cloudinary_public_id")
-  storageUrl            String             @map("storage_url")
-  thumbnailUrl          String?            @map("thumbnail_url")
+  localUploadId         String   @db.Uuid @map("local_upload_id")
+  cloudinaryPublicId    String   @map("cloudinary_public_id")
+  storageUrl            String   @map("storage_url")
+  thumbnailUrl          String?  @map("thumbnail_url")
 
-  exif                  Json                                                   // raw exif JSON
-  exifLat               Float?             @map("exif_lat")
-  exifLon               Float?             @map("exif_lon")
-  exifTimestamp         DateTime?          @map("exif_timestamp")
+  exif                  Json
+  exifLat               Float?   @map("exif_lat")
+  exifLon               Float?   @map("exif_lon")
+  exifTimestamp         DateTime? @map("exif_timestamp")
 
-  captureLat            Float?             @map("capture_lat")
-  captureLon            Float?             @map("capture_lon")
-  captureTimestamp      DateTime?          @map("capture_timestamp")
+  captureLat            Float?   @map("capture_lat")
+  captureLon            Float?   @map("capture_lon")
+  captureTimestamp      DateTime? @map("capture_timestamp")
 
-  uploadLat             Float?             @map("upload_lat")
-  uploadLon             Float?             @map("upload_lon")
-  uploadTimestamp       DateTime?          @map("upload_timestamp")
+  uploadLat             Float?   @map("upload_lat")
+  uploadLon             Float?   @map("upload_lon")
+  uploadTimestamp       DateTime? @map("upload_timestamp")
 
   state                 String?
   district              String?
   block                 String?
   village               String?
 
-  // detected relations
-  detectedCropId        String?            @db.Uuid                              @map("detected_crop_id")
-  detectedCrop          Crop?              @relation(fields: [detectedCropId], references: [id], name: "image_detected_crop")
-  detectedStageId       String?            @db.Uuid                              @map("detected_stage_id")
-  detectedStage         GrowthStage?       @relation(fields: [detectedStageId], references: [id], name: "image_detected_stage")
+  detectedCropId        String?      @db.Uuid @map("detected_crop_id")
+  detectedCrop          Crop?        @relation(fields: [detectedCropId], references: [id], name: "image_detected_crop")
 
-  qualityScore          Float?             @map("quality_score")
-  imageHash             String?            @unique                               @map("image_hash") // sha256 of bytes
+  detectedStageId       String?      @db.Uuid @map("detected_stage_id")
+  detectedStage         GrowthStage? @relation(fields: [detectedStageId], references: [id], name: "image_detected_stage")
 
-  // PostGIS geography point  (Unsupported in Prisma - use raw SQL migrations & raw queries to set/create this)
+  qualityScore          Float?       @map("quality_score")
+  imageHash             String?      @unique @map("image_hash")
+
   geom                  Unsupported("geography(Point,4326)")
 
-  verificationStatus    VerificationStatus @default(PENDING)                    @map("verification_status")
+  verificationStatus    VerificationStatus @default(PENDING) @map("verification_status")
   verificationReason    String?            @map("verification_reason")
   verificationDistanceM Float?             @map("verification_distance_m")
 
-  createdAt             DateTime           @default(now())                        @map("created_at")
+  createdAt             DateTime     @default(now()) @map("created_at")
 
   analytics             ImageAnalytics[]
   reviews               ImageReview[]
@@ -159,9 +244,6 @@ model Image {
   @@map("images")
 }
 
-/*
- * Image analytics - ML outputs
- */
 model ImageAnalytics {
   id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   imageId      String   @db.Uuid
@@ -178,9 +260,6 @@ model ImageAnalytics {
   @@map("image_analytics")
 }
 
-/*
- * Image review / human moderation
- */
 model ImageReview {
   id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   imageId    String   @db.Uuid
@@ -198,9 +277,6 @@ model ImageReview {
   @@map("image_reviews")
 }
 
-/*
- * Crops and growth stages
- */
 model Crop {
   id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   name      String
@@ -211,12 +287,10 @@ model Crop {
 
   stages    GrowthStage[] @relation("crop_stages")
   images    Image[]       @relation("image_detected_crop")
-
   damageCases DamageCase[] @relation("crop_damage_cases")
 
   @@map("crops")
 }
-
 
 model GrowthStage {
   id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
@@ -233,9 +307,6 @@ model GrowthStage {
   @@map("growth_stages")
 }
 
-/*
- * Damage classification and cases
- */
 model DamageCategory {
   id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   name           String?
@@ -249,18 +320,17 @@ model DamageCategory {
 model DamageCase {
   id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   createdBy      String?  @db.Uuid @map("created_by")
-  createdByUser  User?    @relation(fields: [createdBy], references: [id], name: "user_damage_cases")
+  createdByUser  User?    @relation(fields: [createdBy], references: [id], name: "user_damage_cases", onDelete: SetNull)
   regionState    String?  @map("region_state")
   regionDistrict String?  @map("region_district")
   summary        String?
   cropId         String?  @db.Uuid
-  // name the relation so it matches Crop
   crop           Crop?    @relation(fields: [cropId], references: [id], name: "crop_damage_cases")
   severity       String?
   status         String?  @default("open")
   estimatedAreaHa Float?  @map("estimated_area_ha")
   createdAt      DateTime @default(now()) @map("created_at")
-  updatedAt      DateTime @updatedAt @map("updated_at")
+  updatedAt      DateTime @updatedAt       @map("updated_at")
 
   images         DamageCaseImage[]
 
@@ -268,7 +338,6 @@ model DamageCase {
   @@index([status], map: "idx_damage_cases_status")
   @@map("damage_cases")
 }
-
 
 model DamageCaseImage {
   id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
@@ -281,9 +350,6 @@ model DamageCaseImage {
   @@map("damage_case_images")
 }
 
-/*
- * Audit logs - append only
- */
 model AuditLog {
   id        BigInt   @id @default(autoincrement()) @db.BigInt
   eventType String   @map("event_type")

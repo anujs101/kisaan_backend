@@ -1,3 +1,8 @@
+-- ensure extensions exist before any geography columns
+CREATE EXTENSION IF NOT EXISTS postgis;
+CREATE EXTENSION IF NOT EXISTS postgis_topology; -- optional
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 -- CreateEnum
 CREATE TYPE "UploadStatus" AS ENUM ('PENDING', 'COMPLETED', 'FAILED', 'PROCESSING');
 
