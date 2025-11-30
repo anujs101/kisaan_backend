@@ -1,4 +1,0 @@
-API_BASE=http://localhost:4000
-PHONE=+919301783525
-PASSWORD=MyStrongPassw0rd!
-IMAGE_PATH=/Users/anujs101/Downloads/IMG_20251130_041155452_HDR.jpg
