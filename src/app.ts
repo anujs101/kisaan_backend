@@ -11,8 +11,10 @@ import { errorHandler } from "./middleware/errorHandler.js";
 import { requestLogger } from "./middleware/requestLogger.js";
 
 import authRoutes from "@routes/auth";
-// import uploadRoutes from "@routes/upload/index";
+import uploadRoutes from "@routes/uploads.routes"; 
+import farmRoutes from "@routes/farms";
 
+// import { prisma } from "@lib/prisma"; // keep available if you need it here
 import { prisma } from "@lib/prisma";
 
 const logger = pino({ level: process.env.LOG_LEVEL ?? "info" });
@@ -57,14 +59,18 @@ app.use(rateLimiter({ windowMs: 60_000, max: 300 }));
  *   We attach a mild rate limiter on auth routes and rely on more aggressive limits
  *   inside specific handlers (request-otp should have stricter per-phone limits).
  *
- * - Upload routes (presign/complete) — uncomment and mount when implemented.
+ * - Upload routes (presign/complete) — mounted below.
  */
 
 // Core auth routes (email/password, refresh, logout, me, OTP flows consolidated)
 app.use("/api/auth", rateLimiter({ windowMs: 60_000, max: 120 }), authRoutes);
 
-// Upload routes (presign / complete) - keep commented until implemented
-// app.use("/api/upload", rateLimiter({ windowMs: 60_000, max: 60 }), uploadRoutes);
+// Upload routes (presign / complete) - mounted and protected by a per-route rate limiter.
+// Keep a stricter limit here because uploads can be more expensive (sign + complete).
+app.use("/api/uploads", rateLimiter({ windowMs: 60_000, max: 60 }), uploadRoutes);
+
+//farm routes
+app.use("/api/farms", rateLimiter({ windowMs: 60_000, max: 60 }), farmRoutes);
 
 // Health check
 app.get("/health", (_req, res) => {
