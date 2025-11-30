@@ -13,8 +13,19 @@ if (!connectionString) {
 
 const adapter = new PrismaNeon({ connectionString });
 
-// Type assertion to get full PrismaClient types
-const prisma = new PrismaClient({ adapter }) as PrismaClient;
+// ---- FIX: global prisma for hot-reload environments ----
+// @ts-ignore
+const globalForPrisma = globalThis as any;
 
-export { prisma };
+export const prisma =
+  globalForPrisma._prisma ??
+  new PrismaClient({
+    adapter,
+    log: ["query", "info", "warn", "error"],
+  });
+
+if (process.env.NODE_ENV !== "production") {
+  globalForPrisma._prisma = prisma;
+}
+
 export default prisma;

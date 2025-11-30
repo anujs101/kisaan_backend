@@ -12,6 +12,7 @@ import { requestLogger } from "./middleware/requestLogger.js";
 
 import authRoutes from "@routes/auth";
 import uploadRoutes from "@routes/uploads.routes"; 
+import farmRoutes from "@routes/farms";
 
 // import { prisma } from "@lib/prisma"; // keep available if you need it here
 import { prisma } from "@lib/prisma";
@@ -67,6 +68,9 @@ app.use("/api/auth", rateLimiter({ windowMs: 60_000, max: 120 }), authRoutes);
 // Upload routes (presign / complete) - mounted and protected by a per-route rate limiter.
 // Keep a stricter limit here because uploads can be more expensive (sign + complete).
 app.use("/api/uploads", rateLimiter({ windowMs: 60_000, max: 60 }), uploadRoutes);
+
+//farm routes
+app.use("/api/farms", rateLimiter({ windowMs: 60_000, max: 60 }), farmRoutes);
 
 // Health check
 app.get("/health", (_req, res) => {
