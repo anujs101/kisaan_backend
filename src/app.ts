@@ -13,6 +13,7 @@ import { requestLogger } from "./middleware/requestLogger.js";
 import authRoutes from "@routes/auth";
 import uploadRoutes from "@routes/uploads.routes"; 
 import farmRoutes from "@routes/farms";
+import damageRoutes from "@routes/damage.routes";
 
 // import { prisma } from "@lib/prisma"; // keep available if you need it here
 import { prisma } from "@lib/prisma";
@@ -71,7 +72,7 @@ app.use("/api/uploads", rateLimiter({ windowMs: 60_000, max: 60 }), uploadRoutes
 
 //farm routes
 app.use("/api/farms", rateLimiter({ windowMs: 60_000, max: 60 }), farmRoutes);
-
+app.use("/api/damage-report", rateLimiter({ windowMs: 60_000, max: 30 }), damageRoutes);
 // Health check
 app.get("/health", (_req, res) => {
   res.status(200).json({ status: "ok" });
