@@ -260,6 +260,10 @@ model Image {
 
   detectedCropId String? @db.Uuid @map("detected_crop_id")
   detectedCrop Crop? @relation(fields: [detectedCropId], references: [id], name: "image_detected_crop")
+  
+  providedCropId  String? @db.Uuid @map("provided_crop_id")
+  providedCrop    Crop?   @relation("image_provided_crop", fields: [providedCropId], references: [id])
+
 
   detectedStageId String? @db.Uuid @map("detected_stage_id")
   detectedStage GrowthStage? @relation(fields: [detectedStageId], references: [id], name: "image_detected_stage")
@@ -335,6 +339,9 @@ model Crop {
   images Image[] @relation("image_detected_crop")
   damageCases DamageCase[] @relation("crop_damage_cases")
   farmsAsCurrentCrop Farm[] @relation("farm_current_crop")
+  imagesProvided Image[] @relation("image_provided_crop")
+
+
 
   @@map("crops")
 }
