@@ -16,12 +16,17 @@ function sendJson(res: Response, status: number, body: unknown) {
 /**
  * POST /api/farms
  * Create a new farm for the authenticated user.
+ * Now requires cropId (validated in Zod). Verifies crop exists before inserting.
  */
 export async function createFarmHandler(req: AuthRequest, res: Response, next: NextFunction) {
   try {
     const parsed = createFarmSchema.parse(req.body);
     const userId = req.user?.id;
     if (!userId) throw new APIError("Unauthorized", 401, "UNAUTHORIZED");
+
+    // Validate crop exists
+    const crop = await prisma.crop.findUnique({ where: { id: parsed.cropId }, select: { id: true, name: true } });
+    if (!crop) throw new APIError("Specified crop not found", 400, "INVALID_CROP");
 
     // Ensure coordinates are closed ring
     const coords = ensureRingClosedCoords(parsed.boundary.coordinates);
@@ -38,22 +43,22 @@ export async function createFarmHandler(req: AuthRequest, res: Response, next: N
       throw new APIError(`Invalid polygon geometry: ${reason ?? "unknown reason"}`, 400, "INVALID_GEOMETRY");
     }
 
-    // Insert farm and compute center (atomic using PostGIS)
+    // Insert farm and compute center (atomic using PostGIS). Include current_crop_id.
     const sql = `
       WITH geom AS (
         SELECT ST_SetSRID(ST_GeomFromGeoJSON($1::json), 4326) AS g
       ), center AS (
         SELECT ST_Centroid(g) AS c FROM geom
       )
-      INSERT INTO farms ("userId", name, address, boundary, center, center_lat, center_lon, created_at, updated_at)
-      SELECT $2::uuid, $3::text, $4::text, g, c, ST_Y(c), ST_X(c), NOW(), NOW()
+      INSERT INTO farms ("userId", name, address, boundary, center, center_lat, center_lon, created_at, updated_at, current_crop_id)
+      SELECT $2::uuid, $3::text, $4::text, g, c, ST_Y(c), ST_X(c), NOW(), NOW(), $5::uuid
       FROM geom, center
       RETURNING id, "userId", name, address,
                 ST_AsGeoJSON(boundary)::json as boundary,
                 ST_AsGeoJSON(center)::json as center,
-                center_lat, center_lon, created_at, updated_at;
+                center_lat, center_lon, current_crop_id, created_at, updated_at;
     `;
-    const raw = await prisma.$queryRawUnsafe(sql, geojsonText, userId, parsed.name, parsed.address ?? null);
+    const raw = await prisma.$queryRawUnsafe(sql, geojsonText, userId, parsed.name, parsed.address ?? null, parsed.cropId);
     const rows = Array.isArray(raw) ? (raw as any[]) : [];
     const farm = rows[0] ?? null;
 
@@ -65,7 +70,7 @@ export async function createFarmHandler(req: AuthRequest, res: Response, next: N
       eventType: "farm_created",
       userId,
       relatedId: farm.id,
-      payload: { name: farm.name ?? null, address: farm.address ?? null },
+      payload: { name: farm.name ?? null, address: farm.address ?? null, currentCropId: farm.current_crop_id ?? null, cropName: crop.name ?? null },
       ip: req.ip,
       userAgent: req.get("user-agent") ?? null,
     });
@@ -80,6 +85,7 @@ export async function createFarmHandler(req: AuthRequest, res: Response, next: N
 /**
  * GET /api/farms
  * List farms belonging to the authenticated user (paginated).
+ * Includes current_crop_id in results.
  */
 export async function listFarmsHandler(req: AuthRequest, res: Response, next: NextFunction) {
   try {
@@ -94,7 +100,8 @@ export async function listFarmsHandler(req: AuthRequest, res: Response, next: Ne
       SELECT id, "userId", name, address,
              ST_AsGeoJSON(boundary)::json AS boundary,
              ST_AsGeoJSON(center)::json AS center,
-             center_lat, center_lon, created_at, updated_at
+             center_lat, center_lon, current_crop_id,
+             created_at, updated_at
       FROM farms
       WHERE "userId" = $1::uuid
       ORDER BY created_at DESC
@@ -112,6 +119,7 @@ export async function listFarmsHandler(req: AuthRequest, res: Response, next: Ne
 /**
  * GET /api/farms/:id
  * Return a single farm for the authenticated user.
+ * Includes current_crop_id.
  */
 export async function getFarmHandler(req: AuthRequest, res: Response, next: NextFunction) {
   try {
@@ -125,7 +133,8 @@ export async function getFarmHandler(req: AuthRequest, res: Response, next: Next
       SELECT id, "userId", name, address,
              ST_AsGeoJSON(boundary)::json AS boundary,
              ST_AsGeoJSON(center)::json AS center,
-             center_lat, center_lon, created_at, updated_at
+             center_lat, center_lon, current_crop_id,
+             created_at, updated_at
       FROM farms
       WHERE id = $1::uuid AND "userId" = $2::uuid
       LIMIT 1;
@@ -145,9 +154,16 @@ export async function getFarmHandler(req: AuthRequest, res: Response, next: Next
 /**
  * PUT /api/farms/:id
  * Update farm (boundary, name, address) — owner only.
+ * Crop changes are forbidden via API.
  */
 export async function updateFarmHandler(req: AuthRequest, res: Response, next: NextFunction) {
   try {
+    // Defensive: reject attempts to change cropId in the payload even before parsing
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    if ((req.body as any) && Object.prototype.hasOwnProperty.call(req.body as any, "cropId")) {
+      throw new APIError("Updating cropId on a farm is not allowed", 403, "FORBIDDEN");
+    }
+
     const parsed = updateFarmSchema.parse(req.body);
     const userId = req.user?.id;
     if (!userId) throw new APIError("Unauthorized", 401, "UNAUTHORIZED");
@@ -192,7 +208,7 @@ export async function updateFarmHandler(req: AuthRequest, res: Response, next: N
         RETURNING id, "userId", name, address,
                   ST_AsGeoJSON(boundary)::json as boundary,
                   ST_AsGeoJSON(center)::json as center,
-                  center_lat, center_lon, created_at, updated_at;
+                  center_lat, center_lon, current_crop_id, created_at, updated_at;
       `;
       const raw = await prisma.$queryRawUnsafe(updateSql, geojsonText, id, userId);
       const rows = Array.isArray(raw) ? (raw as any[]) : [];
@@ -216,7 +232,7 @@ export async function updateFarmHandler(req: AuthRequest, res: Response, next: N
           idx++;
         }
         params.push(id, userId);
-        const scalarSql = `UPDATE farms SET ${sets.join(", ")}, updated_at = NOW() WHERE id = $${idx}::uuid AND "userId" = $${idx + 1}::uuid RETURNING id, "userId", name, address, ST_AsGeoJSON(boundary)::json as boundary, ST_AsGeoJSON(center)::json as center, center_lat, center_lon, created_at, updated_at;`;
+        const scalarSql = `UPDATE farms SET ${sets.join(", ")}, updated_at = NOW() WHERE id = $${idx}::uuid AND "userId" = $${idx + 1}::uuid RETURNING id, "userId", name, address, ST_AsGeoJSON(boundary)::json as boundary, ST_AsGeoJSON(center)::json as center, center_lat, center_lon, current_crop_id, created_at, updated_at;`;
         const raw2 = await prisma.$queryRawUnsafe(scalarSql, ...params);
         const rows2 = Array.isArray(raw2) ? (raw2 as any[]) : [];
         const farm2 = rows2[0] ?? farm;
@@ -264,7 +280,7 @@ export async function updateFarmHandler(req: AuthRequest, res: Response, next: N
     }
 
     params.push(id, userId);
-    const finalSql = `UPDATE farms SET ${sets.join(", ")}, updated_at = NOW() WHERE id = $${idx}::uuid AND "userId" = $${idx + 1}::uuid RETURNING id, "userId", name, address, ST_AsGeoJSON(boundary)::json as boundary, ST_AsGeoJSON(center)::json as center, center_lat, center_lon, created_at, updated_at;`;
+    const finalSql = `UPDATE farms SET ${sets.join(", ")}, updated_at = NOW() WHERE id = $${idx}::uuid AND "userId" = $${idx + 1}::uuid RETURNING id, "userId", name, address, ST_AsGeoJSON(boundary)::json as boundary, ST_AsGeoJSON(center)::json as center, center_lat, center_lon, current_crop_id, created_at, updated_at;`;
     const finalRaw = await prisma.$queryRawUnsafe(finalSql, ...params);
     const finalRows = Array.isArray(finalRaw) ? (finalRaw as any[]) : [];
     const farm = finalRows[0] ?? null;

@@ -2,15 +2,15 @@
 import { z } from "zod";
 
 /**
- * deviceMeta shape: core expected keys for verification.
+ * deviceMeta shape: REQUIRED for verification.
  *
- * NOTE: farmId is REQUIRED at schema-level now.
- * Server will also enforce:
- *  - farm must exist
- *  - requester must be authenticated and must own the farm
+ * NOTE:
+ * - farmId is REQUIRED (UUID)
+ * - captureLat/Lon + captureTimestamp must be provided
+ * - server handles crop logic internally (providedCropId is NOT client-supplied)
  */
 export const deviceMetaSchema = z.object({
-  // EXIF / device capture coordinates
+  // Required capture coordinates from device at moment of capture
   captureLat: z.number().min(-90).max(90),
   captureLon: z.number().min(-180).max(180),
 
@@ -20,44 +20,57 @@ export const deviceMetaSchema = z.object({
     { message: "captureTimestamp must be a valid ISO datetime string" }
   ),
 
-  // Optional device metadata
+  // Device metadata (optional)
   deviceModel: z.string().optional(),
   os: z.string().optional(),
 
   /**
-   * Farm ID — REQUIRED.
-   * Must be a UUID. Server performs existence & ownership checks and will reject
-   * requests if the farm doesn't exist or doesn't belong to the authenticated user.
+   * REQUIRED farm ID.
+   * Server will:
+   *  - Validate UUID format (here)
+   *  - Validate existence (controller)
+   *  - Validate ownership (controller)
    */
   farmId: z.string().uuid(),
-}).passthrough(); // allow extra metadata if future devices include more fields
+}).passthrough(); // allow additional metadata fields if needed
+
 
 /**
- * First step:
- * Device sends localUploadId + metadata so server can create Upload row,
- * generate Cloudinary signed params, and return signature/public_id.
+ * STEP 1: Client requests Cloudinary signature.
+ *
+ * MUST include:
+ * - localUploadId (UUID)
+ * - deviceMeta (MUST include farmId + capture info)
  */
 export const signRequestSchema = z.object({
   localUploadId: z.string().uuid(),
   deviceMeta: deviceMetaSchema,
+
+  // optional Cloudinary details
   folder: z.string().optional(),
   filename: z.string().optional(),
 });
 
+
 /**
- * After Cloudinary finishes the upload, client calls this.
- * NOTE:
- * - EXIF + deviceMeta determine coordinates; backend ignores uploadLat/uploadLon.
- * - These fields remain optional for backward compatibility.
+ * STEP 2: Client completes upload after Cloudinary finishes.
+ *
+ * Server:
+ * - fetches EXIF from Cloudinary
+ * - compares EXIF vs deviceMeta
+ * - assigns providedCropId from farm.currentCropId
+ * - creates Image row
  */
 export const completeRequestSchema = z.object({
   localUploadId: z.string().uuid(),
-  public_id: z.string(),
+  public_id: z.string().min(1),
   version: z.number().int().positive(),
 
-  // Deprecated / optional — server no longer relies on these
+  /**
+   * Deprecated — server ignores for verification.
+   * Still accepted for backward compatibility.
+   */
   uploadLat: z.number().min(-90).max(90).nullable().optional(),
   uploadLon: z.number().min(-180).max(180).nullable().optional(),
   uploadTimestamp: z.string().nullable().optional(),
-
 });
