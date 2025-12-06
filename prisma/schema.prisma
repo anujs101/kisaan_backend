@@ -188,6 +188,11 @@ model Farm {
   updatedAt DateTime @updatedAt @map("updated_at")
 
   images Image[] @relation("farm_images")
+  agromonitoringId String? @map("agromonitoring_id")
+  currentCropId String @map("current_crop_id") @db.Uuid
+  currentCrop   Crop   @relation(fields: [currentCropId], references: [id], name: "farm_current_crop", onDelete: Restrict)
+
+  damageCases DamageCase[]
 
   @@map("farms")
   @@index([userId], map: "idx_farms_user_id")
@@ -329,6 +334,7 @@ model Crop {
   stages GrowthStage[] @relation("crop_stages")
   images Image[] @relation("image_detected_crop")
   damageCases DamageCase[] @relation("crop_damage_cases")
+  farmsAsCurrentCrop Farm[] @relation("farm_current_crop")
 
   @@map("crops")
 }
@@ -372,6 +378,12 @@ model DamageCase {
   estimatedAreaHa Float? @map("estimated_area_ha")
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
+
+  farmId String? @db.Uuid
+  farm Farm? @relation(fields: [farmId], references: [id], onDelete: SetNull)
+  
+  damageType String? @map("damage_type")
+  reportDetails Json? @map("report_details") // Stores the full analysis JSON
 
   images DamageCaseImage[]
 
