@@ -30,31 +30,48 @@ export async function signHandler(req: AuthRequest, res: Response, next: NextFun
 
     const { localUploadId, deviceMeta, folder, filename } = parsed;
 
-    const declaredFarmId = (deviceMeta as any)?.farmId ?? (deviceMeta as any)?.farm_id ?? null;
+    // Validate farm ownership if farmId is provided
+    const declaredFarmId =
+      (deviceMeta as any)?.farmId ?? (deviceMeta as any)?.farm_id ?? null;
+
     if (declaredFarmId) {
       if (!userId) {
         return sendJson(res, 403, {
           status: "error",
-          error: { message: "Authentication required when associating upload with a farm", code: "FORBIDDEN" },
+          error: {
+            message: "Authentication required when associating upload with a farm",
+            code: "FORBIDDEN",
+          },
         });
       }
+
       const farm = await prisma.farm.findUnique({
         where: { id: declaredFarmId },
         select: { id: true, userId: true },
       });
+
       if (!farm) {
-        return sendJson(res, 404, { status: "error", error: { message: "Farm not found", code: "FARM_NOT_FOUND" } });
+        return sendJson(res, 404, {
+          status: "error",
+          error: { message: "Farm not found", code: "FARM_NOT_FOUND" },
+        });
       }
+
       if (farm.userId !== userId) {
-        return sendJson(res, 403, { status: "error", error: { message: "You do not own the specified farm", code: "FORBIDDEN" } });
+        return sendJson(res, 403, {
+          status: "error",
+          error: { message: "You do not own the specified farm", code: "FORBIDDEN" },
+        });
       }
     }
 
+    // Detect if device-capture metadata is complete
     const hasCaptureCoords =
-      deviceMeta?.captureLat !== undefined &&
-      deviceMeta?.captureLon !== undefined &&
-      deviceMeta?.captureTimestamp;
+      deviceMeta?.captureLat != null &&
+      deviceMeta?.captureLon != null &&
+      deviceMeta?.captureTimestamp != null;
 
+    // Store upload record
     await prisma.upload.create({
       data: {
         userId,
@@ -65,18 +82,30 @@ export async function signHandler(req: AuthRequest, res: Response, next: NextFun
       },
     });
 
-    const public_id = userId ? `${userId}/${localUploadId}` : `uploads/${localUploadId}`;
+    // Construct Cloudinary public_id
+    const public_id = userId
+      ? `${userId}/${localUploadId}`
+      : `uploads/${localUploadId}`;
 
+    // FINAL — Folder must be consistent across signature/client/Cloudinary
+    const signedFolder = folder ?? "uploads";
+
+    // Generate signature WITH folder included
     const { signature, timestamp } = signUploadParams({
       public_id,
-      folder: folder ?? "uploads",
+      folder: signedFolder,
     });
 
+    // Persist metadata
     await updateUploadCloudMeta(localUploadId, {
-      signedParams: { public_id, folder: folder ?? "uploads" } as Prisma.InputJsonValue,
+      signedParams: {
+        public_id,
+        folder: signedFolder,
+      } as Prisma.InputJsonValue,
       uploadStatus: "PENDING",
     });
 
+    // SEND FOLDER TO CLIENT — VERY IMPORTANT
     return sendJson(res, 200, {
       status: "ok",
       data: {
@@ -85,6 +114,7 @@ export async function signHandler(req: AuthRequest, res: Response, next: NextFun
         apiKey: process.env.CLOUDINARY_API_KEY,
         cloudName: process.env.CLOUDINARY_CLOUD_NAME,
         public_id,
+        folder: signedFolder, // >>> REQUIRED for signature match
       },
     });
   } catch (err) {
@@ -103,80 +133,106 @@ export async function completeHandler(req: AuthRequest, res: Response, next: Nex
 
     const upload = await prisma.upload.findUnique({ where: { localUploadId } });
     if (!upload)
-      return sendJson(res, 404, { status: "error", error: { message: "Upload not found", code: "NOT_FOUND" } });
+      return sendJson(res, 404, {
+        status: "error",
+        error: { message: "Upload not found", code: "NOT_FOUND" },
+      });
 
     if (upload.userId && userId && upload.userId !== userId) {
       return sendJson(res, 403, {
         status: "error",
-        error: { message: "Forbidden - upload belongs to a different user", code: "FORBIDDEN" },
+        error: {
+          message: "Forbidden - upload belongs to a different user",
+          code: "FORBIDDEN",
+        },
       });
     }
 
     const deviceMeta = upload.deviceMeta as any;
-    if (!deviceMeta?.captureLat || !deviceMeta?.captureLon || !deviceMeta?.captureTimestamp) {
+
+    // Ensure required EXIF device metadata exists
+    if (
+      !deviceMeta?.captureLat ||
+      !deviceMeta?.captureLon ||
+      !deviceMeta?.captureTimestamp
+    ) {
       await updateUploadCloudMeta(localUploadId, { uploadStatus: "FAILED" });
       return sendJson(res, 400, {
         status: "error",
-        error: { message: "Device-capture metadata missing — upload rejected", code: "BAD_REQUEST" },
+        error: {
+          message: "Device-capture metadata missing — upload rejected",
+          code: "BAD_REQUEST",
+        },
       });
     }
 
     const deviceLat = Number(deviceMeta.captureLat);
     const deviceLon = Number(deviceMeta.captureLon);
 
-    let deviceTs: Date | null = null;
+    let deviceTs: Date;
     try {
       deviceTs = normalizeExifTimestamp(deviceMeta.captureTimestamp);
     } catch {
-      await updateUploadCloudMeta(localUploadId, { cloudinaryPublicId: public_id, uploadStatus: "FAILED" });
-      return sendJson(res, 400, { status: "error", error: { message: "Invalid capture timestamp", code: "BAD_REQUEST" } });
+      await updateUploadCloudMeta(localUploadId, {
+        cloudinaryPublicId: public_id,
+        uploadStatus: "FAILED",
+      });
+      return sendJson(res, 400, {
+        status: "error",
+        error: { message: "Invalid capture timestamp", code: "BAD_REQUEST" },
+      });
     }
 
-    // =============== NEW LOGIC HERE ==================
-    // Provided crop ID (if farmId declared)
+    // Provided crop ID via farm
     let providedCropId: string | null = null;
     const farmIdDeclared = deviceMeta?.farmId ?? deviceMeta?.farm_id ?? null;
 
     if (farmIdDeclared) {
-      if (!userId)
-        return sendJson(res, 403, {
-          status: "error",
-          error: { message: "Authentication required for farm-linked upload", code: "FORBIDDEN" },
-        });
-
       const farm = await prisma.farm.findUnique({
         where: { id: farmIdDeclared },
         select: { id: true, userId: true, currentCropId: true },
       });
 
       if (!farm)
-        return sendJson(res, 404, { status: "error", error: { message: "Farm not found", code: "FARM_NOT_FOUND" } });
+        return sendJson(res, 404, {
+          status: "error",
+          error: { message: "Farm not found", code: "FARM_NOT_FOUND" },
+        });
 
       if (farm.userId !== userId)
         return sendJson(res, 403, {
           status: "error",
-          error: { message: "You do not own the specified farm", code: "FORBIDDEN" },
+          error: {
+            message: "You do not own the specified farm",
+            code: "FORBIDDEN",
+          },
         });
 
       providedCropId = farm.currentCropId;
     }
-    // =================================================
 
-    // Fetch Cloudinary resource EXIF
+    // Fetch EXIF from Cloudinary
     const resource = await fetchResourceMetadata(public_id);
     const exif = (resource as any).exif ?? null;
+
     if (!exif) {
-      await updateUploadCloudMeta(localUploadId, { cloudinaryPublicId: public_id, uploadStatus: "FAILED" });
+      await updateUploadCloudMeta(localUploadId, {
+        cloudinaryPublicId: public_id,
+        uploadStatus: "FAILED",
+      });
       return sendJson(res, 400, {
         status: "error",
         error: { message: "EXIF missing — upload rejected", code: "BAD_REQUEST" },
       });
     }
 
-    const gpsLatRaw = exif.GPSLatitude ?? exif["GPSLatitude"];
-    const gpsLonRaw = exif.GPSLongitude ?? exif["GPSLongitude"];
+    const gpsLatRaw = exif.GPSLatitude;
+    const gpsLonRaw = exif.GPSLongitude;
     const timeRaw =
-      exif.DateTimeOriginal ?? exif["DateTimeOriginal"] ?? exif.DateTime ?? null;
+      exif.DateTimeOriginal ??
+      exif["DateTimeOriginal"] ??
+      exif.DateTime ??
+      null;
 
     const exifLat = parseExifGps(gpsLatRaw);
     const exifLon = parseExifGps(gpsLonRaw);
@@ -206,10 +262,16 @@ export async function completeHandler(req: AuthRequest, res: Response, next: Nex
       });
     }
 
-    const distanceMeters = haversineDistanceMeters(deviceLat, deviceLon, exifLat, exifLon);
+    const distanceMeters = haversineDistanceMeters(
+      deviceLat,
+      deviceLon,
+      exifLat,
+      exifLon
+    );
+
     const tolerance = Number(process.env.VERIFICATION_TOLERANCE_METERS ?? "50");
 
-    let verificationOutcome: "VERIFIED" | "FLAGGED" =
+    const verificationOutcome =
       distanceMeters <= tolerance ? "VERIFIED" : "FLAGGED";
 
     const secureUrl = (resource as any).secure_url ?? (resource as any).url ?? "";
@@ -226,12 +288,15 @@ export async function completeHandler(req: AuthRequest, res: Response, next: Nex
         });
         return sendJson(res, 400, {
           status: "error",
-          error: { message: "uploadTimestamp invalid", code: "BAD_REQUEST" },
+          error: {
+            message: "uploadTimestamp invalid",
+            code: "BAD_REQUEST",
+          },
         });
       }
     }
 
-    // ================ CREATE IMAGE RECORD (UPDATED) ====================
+    // Create Image Record
     let image: any;
     try {
       image = await createImageRecordRaw({
@@ -241,7 +306,7 @@ export async function completeHandler(req: AuthRequest, res: Response, next: Nex
         cloudinaryPublicId: public_id,
         storageUrl: secureUrl,
         thumbnailUrl,
-        exif: exif ?? {},
+        exif,
         exifLat,
         exifLon,
         exifTimestamp: exifTs,
@@ -252,7 +317,7 @@ export async function completeHandler(req: AuthRequest, res: Response, next: Nex
         uploadLon: parsed.uploadLon ?? null,
         uploadTimestamp: normalizedUploadTs,
         farmId: farmIdDeclared ?? null,
-        providedCropId, // NEW
+        providedCropId,
       });
     } catch (err) {
       console.error("[completeHandler] createImageRecordRaw failed", err);
@@ -262,14 +327,19 @@ export async function completeHandler(req: AuthRequest, res: Response, next: Nex
       });
       return sendJson(res, 400, {
         status: "error",
-        error: { message: "Failed to create image record", details: String(err) },
+        error: {
+          message: "Failed to create image record",
+          details: String(err),
+        },
       });
     }
-    // ================================================================
 
     const imageId = (image as any)?.id;
     if (!imageId) {
-      await updateUploadCloudMeta(localUploadId, { cloudinaryPublicId: public_id, uploadStatus: "FAILED" });
+      await updateUploadCloudMeta(localUploadId, {
+        cloudinaryPublicId: public_id,
+        uploadStatus: "FAILED",
+      });
       return sendJson(res, 500, {
         status: "error",
         error: { message: "Failed to create image record", code: "INTERNAL" },

@@ -1,8 +1,7 @@
-// src/services/cloudinary.service.ts
 import { v2 as cloudinary } from "cloudinary";
 import { prisma } from "@lib/prisma";
 import { Prisma } from "@prisma/client";
-
+import crypto from "crypto";
 const CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
 const API_KEY = process.env.CLOUDINARY_API_KEY;
 const API_SECRET = process.env.CLOUDINARY_API_SECRET;
@@ -18,24 +17,44 @@ cloudinary.config({
 });
 
 /** Sign Cloudinary upload params server-side for signed upload */
-export function signUploadParams(paramsToSign: Record<string, unknown>): { signature: string; timestamp: number } {
+
+/**
+ * Generate a Cloudinary API signature for authenticated uploads.
+ * Must include ALL parameters that will be sent to Cloudinary, sorted alphabetically.
+ *
+ * Accepts optional `folder`. If `folder` is provided it is included in the signature.
+ *
+ * Example usage:
+ *  signUploadParams({ public_id, folder: "uploads" })
+ *
+ * This will produce a signature for the canonical string:
+ *   folder=uploads&public_id=...&timestamp=...
+ */
+export function signUploadParams(params: { public_id: string; folder?: string }) {
   const timestamp = Math.floor(Date.now() / 1000);
 
-  // Convert params to plain strings/numbers (Cloudinary expects primitives)
-  const toSign: Record<string, string | number> = {};
-  for (const [k, v] of Object.entries(paramsToSign)) {
-    if (v === undefined || v === null) continue;
-    if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") {
-      toSign[k] = v as string | number;
-    } else {
-      // fallback to JSON string
-      toSign[k] = JSON.stringify(v);
-    }
-  }
-  toSign.timestamp = timestamp;
+  // Build payload only with parameters that will actually be sent to Cloudinary.
+  // This prevents signature mismatches when folder is omitted.
+  const payload: Record<string, string | number> = {
+    public_id: params.public_id,
+    timestamp,
+  };
 
-  // @ts-ignore cloudinary types accept a plain object here
-  const signature = cloudinary.utils.api_sign_request(toSign, API_SECRET);
+  if (params.folder !== undefined && params.folder !== null && String(params.folder).length > 0) {
+    payload.folder = params.folder;
+  }
+
+  // Sort keys alphabetically and build canonical string
+  const sortedKeys = Object.keys(payload).sort();
+  const stringToSign = sortedKeys.map((key) => `${key}=${payload[key]}`).join("&");
+
+  const apiSecret = API_SECRET;
+  if (!apiSecret) {
+    throw new Error("CLOUDINARY_API_SECRET is not set in environment");
+  }
+
+  const signature = crypto.createHash("sha1").update(stringToSign + apiSecret).digest("hex");
+
   return { signature, timestamp };
 }
 

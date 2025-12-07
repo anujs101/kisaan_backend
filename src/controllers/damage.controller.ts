@@ -66,42 +66,80 @@ export async function createDamageReport(req: AuthRequest, res: Response, next: 
  * Lazy-load processing: If 'processing', runs pipeline synchronously then returns.
  */
 export async function getDamageReport(req: AuthRequest, res: Response, next: NextFunction) {
+  const reportId = req.params.id;
+  const userId = req.user?.id;
+
+  console.log(`[DamageReport] → GET /damage-report/${reportId} by user ${userId}`);
+
   try {
-    const userId = req.user?.id;
-    const { id } = req.params;
+    if (!userId) {
+      console.warn(`[DamageReport] ❌ Unauthorized access (no userId)`);
+      throw new APIError("Unauthorized", 401);
+    }
 
-    if (!userId) throw new APIError("Unauthorized", 401);
+    const report = await prisma.damageCase.findUnique({ where: { id: reportId } });
 
-    const report = await prisma.damageCase.findUnique({
-      where: { id }
-    });
+    if (!report) {
+      console.warn(`[DamageReport] ❌ Report not found: ${reportId}`);
+      throw new APIError("Report not found", 404);
+    }
 
-    if (!report) throw new APIError("Report not found", 404);
-    if (report.createdBy !== userId) throw new APIError("Forbidden", 403);
+    if (report.createdBy !== userId) {
+      console.warn(
+        `[DamageReport] ❌ Forbidden: user ${userId} is not the owner of report ${reportId} (owner = ${report.createdBy})`
+      );
+      throw new APIError("Forbidden", 403);
+    }
 
-    // If completed, return data
+    console.log(
+      `[DamageReport] ✔ Found report ${reportId}, status=${report.status}`
+    );
+
+    // If completed, return stored result
     if (report.status === "completed" && report.reportDetails) {
+      console.log(`[DamageReport] ✔ Returning completed report ${reportId}`);
       return sendJson(res, 200, report.reportDetails);
     }
 
     // If processing, RUN PIPELINE
     if (report.status === "processing") {
+      console.log(`[DamageReport] 🔄 Running analysis pipeline for report ${reportId}...`);
+      
+
       try {
-        // Trigger the pipeline synchronously (as requested)
-        const result = await damageService.processDamageReport(id!);
+       
+        const result = await damageService.processDamageReport(reportId!);
+
+        console.log(
+          `[DamageReport] ✅ Pipeline succeeded for report ${reportId}`
+        );
+
         return sendJson(res, 200, result);
       } catch (pipelineErr) {
-        console.error("Pipeline failed", pipelineErr);
-        // Mark failed
+        console.error(
+          `[DamageReport] ❌ Pipeline failed for report ${reportId}:`,
+          pipelineErr
+        );
+
         await prisma.damageCase.update({
-          where: { id },
+          where: { id: reportId },
           data: { status: "failed" }
         });
-        throw new APIError("Analysis pipeline failed", 500, "ANALYSIS_FAILED", { originalError: String(pipelineErr) });
+
+        throw new APIError(
+          "Analysis pipeline failed",
+          500,
+          "ANALYSIS_FAILED",
+          { originalError: String(pipelineErr) }
+        );
       }
     }
 
-    // Default fallback (e.g. if failed or unknown)
+    // Default fallback
+    console.warn(
+      `[DamageReport] ⚠ Report ${reportId} in non-processing state: ${report.status}`
+    );
+
     return sendJson(res, 200, {
       id: report.id,
       status: report.status,
@@ -109,6 +147,10 @@ export async function getDamageReport(req: AuthRequest, res: Response, next: Nex
     });
 
   } catch (err) {
+    console.error(
+      `[DamageReport] ❌ Error handling GET /damage-report/${reportId}:`,
+      err
+    );
     return next(err);
   }
 }

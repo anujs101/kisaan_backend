@@ -25,6 +25,12 @@ const router = express.Router();
 
 // 1) Request OTP (signup or login)
 router.post("/request-otp", validate(requestOtpSchema, "body"), requestOtpHandler);
+/*{
+    "phone": "+919301783525",
+    "purpose": "signup",
+    "metadata": { "fullName": "Anuj", "email": "ok.anuj30@gmail.com" },
+    "clientNonce": "00000000-0000-0000-0000-000000000000"
+  }*/
 
 // 2) Verify OTP (sessionId + otp)
 router.post("/verify-otp", validate(verifyOtpSchema, "body"), verifyOtpHandler);

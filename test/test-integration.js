@@ -1,5 +1,5 @@
-// test-upload-flow.js
-// Run: bun run test-upload-flow.js
+// test-integration.js
+// Run: bun run test-integration.js
 
 import fs from "fs";
 import path from "path";
@@ -11,9 +11,14 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
+// -----------------------------
+// CONFIG / ENV
+// -----------------------------
 const API_BASE = process.env.API_BASE ?? "http://localhost:4000";
+const API_ROOT = API_BASE.endsWith("/api") ? API_BASE : `${API_BASE}/api`;
+
 const PHONE = process.env.PHONE ?? "+919301783525";
-const PASSWORD = process.env.PASSWORD ?? "MyStrongPassw0rd!";
+const PASSWORD = process.env.PASSWORD ?? "MyStrongPassw0rd!"; // using the same password as first file (hard-coded default)
 const IMAGE_PATH =
   process.env.IMAGE_PATH ??
   "/Users/anujs101/Downloads/IMG_20251130_041155452_HDR.jpg";
@@ -21,6 +26,11 @@ const IMAGE_PATH =
 const DEVICE_MODEL = process.env.DEVICE_MODEL ?? "Pixel-Emu";
 const DEVICE_OS = process.env.DEVICE_OS ?? "Android-Unknown";
 
+// Polling settings (for damage report)
+const POLL_MAX_ATTEMPTS = 15;
+const POLL_DELAY_MS = 2000;
+
+// Helper pretty printer
 function pretty(o) {
   try {
     return JSON.stringify(o, null, 2);
@@ -50,22 +60,19 @@ async function readExif(imagePath) {
   const lon = gps?.longitude ?? null;
 
   let ts = null;
-  if (all?.DateTimeOriginal instanceof Date)
-    ts = all.DateTimeOriginal.toISOString();
-  else if (all?.CreateDate instanceof Date)
-    ts = all.CreateDate.toISOString();
-  else if (all?.ModifyDate instanceof Date)
-    ts = all.ModifyDate.toISOString();
+  if (all?.DateTimeOriginal instanceof Date) ts = all.DateTimeOriginal.toISOString();
+  else if (all?.CreateDate instanceof Date) ts = all.CreateDate.toISOString();
+  else if (all?.ModifyDate instanceof Date) ts = all.ModifyDate.toISOString();
 
   console.log(`   exifLat: ${lat} exifLon: ${lon} exifTsIso: ${ts}`);
   return { lat, lon, ts, raw: all };
 }
 
 // -----------------------------
-// AUTH
+// AUTH (login by password)
 // -----------------------------
 async function loginByPassword(phone, password) {
-  const url = `${API_BASE}/api/auth/login-password`;
+  const url = `${API_ROOT}/auth/login-password`;
   console.log(`→ Logging in with phone: ${phone}`);
 
   const resp = await axios
@@ -93,10 +100,10 @@ async function loginByPassword(phone, password) {
 }
 
 // -----------------------------
-// CROPS
+// CROPS (via API)
 // -----------------------------
 async function getCrops(accessToken) {
-  const url = `${API_BASE}/api/crops?page=1&perPage=50`;
+  const url = `${API_ROOT}/crops?page=1&perPage=50`;
 
   const resp = await axios.get(url, {
     headers: { Authorization: `Bearer ${accessToken}` },
@@ -114,7 +121,7 @@ async function getCrops(accessToken) {
 }
 
 async function createCrop(accessToken) {
-  const url = `${API_BASE}/api/crops`;
+  const url = `${API_ROOT}/crops`;
 
   const body = {
     name: "Wheat",
@@ -140,10 +147,10 @@ async function createCrop(accessToken) {
 }
 
 // -----------------------------
-// FARMS
+// FARMS (via API)
 // -----------------------------
 async function getFarms(accessToken) {
-  const url = `${API_BASE}/api/farms?page=1&perPage=50`;
+  const url = `${API_ROOT}/farms?page=1&perPage=50`;
 
   const resp = await axios.get(url, {
     headers: { Authorization: `Bearer ${accessToken}` },
@@ -157,7 +164,7 @@ async function getFarms(accessToken) {
 }
 
 async function createFarm(accessToken, name, address, boundaryGeoJson, cropId) {
-  const url = `${API_BASE}/api/farms`;
+  const url = `${API_ROOT}/farms`;
   const body = { name, address, boundary: boundaryGeoJson, cropId };
 
   const resp = await axios.post(url, body, {
@@ -167,17 +174,16 @@ async function createFarm(accessToken, name, address, boundaryGeoJson, cropId) {
 
   console.log(`→ POST ${url} => [${resp.status}] ${pretty(resp.data)}`);
 
-  if (resp.status === 201 || resp.status === 200)
-    return resp.data?.data?.farm ?? null;
+  if (resp.status === 201 || resp.status === 200) return resp.data?.data?.farm ?? null;
 
   throw new Error("createFarm failed");
 }
 
 // -----------------------------
-// UPLOAD + VERIFY FLOW
+// UPLOAD + VERIFY FLOW (Cloudinary signing via backend)
 // -----------------------------
 async function requestSign(accessToken, localUploadId, deviceMeta, folder, filename) {
-  const url = `${API_BASE}/api/uploads/cloudinary/sign`;
+  const url = `${API_ROOT}/uploads/cloudinary/sign`;
   const body = { localUploadId, deviceMeta, folder, filename };
 
   const resp = await axios.post(url, body, {
@@ -191,15 +197,7 @@ async function requestSign(accessToken, localUploadId, deviceMeta, folder, filen
   throw new Error("requestSign failed");
 }
 
-async function uploadToCloudinary(
-  cloudName,
-  apiKey,
-  signature,
-  timestamp,
-  public_id,
-  imagePath,
-  extraParams = {}
-) {
+async function uploadToCloudinary(cloudName, apiKey, signature, timestamp, public_id, imagePath, extraParams = {}) {
   const url = `https://api.cloudinary.com/v1_1/${cloudName}/image/upload`;
   console.log(`→ Uploading to Cloudinary: ${url}`);
 
@@ -227,7 +225,7 @@ async function uploadToCloudinary(
 }
 
 async function notifyComplete(accessToken, localUploadId, public_id, version) {
-  const url = `${API_BASE}/api/uploads/cloudinary/complete`;
+  const url = `${API_ROOT}/uploads/cloudinary/complete`;
   const body = { localUploadId, public_id, version };
 
   const resp = await axios.post(url, body, {
@@ -242,7 +240,39 @@ async function notifyComplete(accessToken, localUploadId, public_id, version) {
 }
 
 // -----------------------------
-// POLYGON
+// DAMAGE REPORT
+// -----------------------------
+async function submitDamageReport(accessToken, payload) {
+  const url = `${API_ROOT}/damage-report`;
+  const resp = await axios.post(url, payload, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+    validateStatus: () => true,
+  });
+  console.log(`→ POST ${url} => [${resp.status}] ${pretty(resp.data)}`);
+
+  if (resp.status >= 200 && resp.status < 300) return resp.data?.data;
+  throw new Error("submitDamageReport failed");
+}
+
+async function getDamageReport(accessToken, reportId) {
+  const url = `${API_ROOT}/damage-report/${reportId}`;
+  const resp = await axios.get(url, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+    validateStatus: () => true,
+  });
+
+  // Log full response for debugging when non-2xx:
+  if (!(resp.status >= 200 && resp.status < 300)) {
+    console.error(`→ GET ${url} => [${resp.status}] ${pretty(resp.data)}`);
+    // Return the body instead of throwing so the caller can inspect it:
+    return resp.data ?? { status: "error", httpStatus: resp.status };
+  }
+
+  return resp.data ?? null;
+}
+
+// -----------------------------
+// POLYGON helper
 // -----------------------------
 function tinySquarePolygon(lon, lat, delta = 0.0012) {
   return {
@@ -263,21 +293,26 @@ function tinySquarePolygon(lon, lat, delta = 0.0012) {
 // MAIN
 // -----------------------------
 async function main() {
-  console.log("=== START test-upload-flow ===");
+  console.log("=== START test-integration ===");
 
+  // 1) Read EXIF
   const exif = await readExif(IMAGE_PATH);
   if (!exif?.lat || !exif.lon || !exif.ts) {
     console.error("Image missing EXIF GPS/timestamp");
     process.exit(1);
   }
 
+  // 2) Login with password (hard-coded default as requested)
   const login = await loginByPassword(PHONE, PASSWORD);
   const accessToken = login.accessToken;
+  if (!accessToken) {
+    console.error("No access token returned - aborting");
+    process.exit(1);
+  }
   console.log("→ Logged in, token length:", accessToken.length);
 
-  // --- Ensure crop exists ---
+  // 3) Ensure crop exists (keep API-based flow)
   let crops = await getCrops(accessToken);
-
   let cropId;
   if (crops.length === 0) {
     console.log("→ No crops found, creating Wheat...");
@@ -286,10 +321,9 @@ async function main() {
   } else {
     cropId = crops[0].id;
   }
-
   console.log("→ Using cropId:", cropId);
 
-  // --- Ensure farm exists ---
+  // 4) Ensure farm exists
   let farms = await getFarms(accessToken);
   let farm = farms[0];
 
@@ -309,7 +343,7 @@ async function main() {
   const farmId = farm.id;
   console.log("→ Using farmId:", farmId);
 
-  // --- Upload flow ---
+  // 5) Upload flow (Cloudinary -> notify backend)
   const localUploadId = uuidv4();
   const deviceMeta = {
     captureLat: exif.lat,
@@ -327,6 +361,11 @@ async function main() {
     "uploads",
     path.basename(IMAGE_PATH)
   );
+
+  if (!sign) {
+    console.error("Signing response invalid or empty");
+    process.exit(1);
+  }
 
   const cloudResp = await uploadToCloudinary(
     sign.cloudName,
@@ -347,9 +386,82 @@ async function main() {
 
   console.log("=== UPLOAD FLOW RESULT ===");
   console.log(pretty(complete));
+
+  // 6) Submit damage report using the uploaded image (use image URL returned by backend or placeholder)
+  // Try to get stored image URL from notifyComplete response (`complete` variable)
+  // Backend may return an image object or URLs in `complete`. We'll try a few candidates.
+  let photoUrl = null;
+  if (complete?.image?.storageUrl) photoUrl = complete.image.storageUrl;
+  else if (complete?.image?.storage_url) photoUrl = complete.image.storage_url;
+  else if (complete?.public_id) {
+    // Cloudinary URL fallback (unsigned pattern won't always be valid). Try building a URL:
+    // https://res.cloudinary.com/<cloudName>/image/upload/v<version>/<public_id>.jpg
+    // But prefer backend-provided storage URL.
+    const version = cloudResp.version ?? "v1";
+    photoUrl = `https://res.cloudinary.com/${sign.cloudName}/image/upload/v${version}/${cloudResp.public_id}`;
+  } else {
+    // As a last fallback, use Cloudinary response `secure_url`
+    photoUrl = cloudResp.secure_url ?? cloudResp.url ?? null;
+  }
+
+  if (!photoUrl) {
+    console.warn("No photo URL determined from responses; using placeholder image URL");
+    photoUrl = "https://placehold.co/600x400.jpg";
+  }
+
+  console.log("→ Using photo URL for damage report:", photoUrl);
+
+  const reportPayload = {
+    farmId: farmId,
+    damageType: "Drought",
+    cropType: "Wheat",
+    photos: [photoUrl],
+  };
+
+  const submitRes = await submitDamageReport(accessToken, reportPayload);
+  const reportId = submitRes?.reportId ?? submitRes?.id ?? null;
+
+  if (!reportId) {
+    console.error("Damage report submission did not return an ID. Response:", pretty(submitRes));
+    process.exit(1);
+  }
+
+  console.log(`   -> Report Submitted! ID: ${reportId}`);
+
+  // 7) Poll for results
+  console.log("⏳ Waiting for Analysis Pipeline (Satellite + Weather + ML)...");
+
+  let attempts = 0;
+  while (attempts < POLL_MAX_ATTEMPTS) {
+    const checkRes = await getDamageReport(accessToken, reportId);
+    const status = checkRes?.status ?? checkRes?.data?.status ?? null;
+
+    if (status === "completed" || status === "done") {
+      console.log("\n✅ ANALYSIS COMPLETE!");
+      // normalize payload
+      const data = checkRes?.data ?? checkRes;
+      console.log("================================================");
+      console.log("Result payload:", pretty(data));
+      console.log("================================================");
+      process.exit(0);
+    }
+
+    if (status === "failed") {
+      console.error("❌ Pipeline Failed. Response:", pretty(checkRes));
+      process.exit(1);
+    }
+
+    // not done yet
+    await new Promise((r) => setTimeout(r, POLL_DELAY_MS));
+    process.stdout.write(".");
+    attempts++;
+  }
+
+  console.log("\n⚠️ Timeout: Analysis took too long or stayed in 'processing'.");
+  process.exit(1);
 }
 
 main().catch((err) => {
-  console.error("Unhandled error:", err);
+  console.error("Unhandled error:", err?.response?.data ?? err?.message ?? err);
   process.exit(1);
 });
