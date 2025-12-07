@@ -434,6 +434,7 @@ async function main() {
   let attempts = 0;
   while (attempts < POLL_MAX_ATTEMPTS) {
     const checkRes = await getDamageReport(accessToken, reportId);
+    console.log(checkRes);
     const status = checkRes?.status ?? checkRes?.data?.status ?? null;
 
     if (status === "completed" || status === "done") {
