@@ -96,6 +96,7 @@ model User {
   createdAt     DateTime @default(now()) @map("created_at")
   updatedAt     DateTime @updatedAt @map("updated_at")
 
+  refreshTokens    RefreshToken[]    @relation("user_refresh_tokens")
   uploads          Upload[]          @relation("user_uploads")
   images           Image[]           @relation("user_images")
   farms            Farm[]            @relation("user_farms")
@@ -108,6 +109,74 @@ model User {
   cce CCE? @relation("user_cce")
 
   @@map("users")
+}
+
+model RefreshToken {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+  userId String @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], name: "user_refresh_tokens", onDelete: Cascade)
+
+  tokenHash String   @map("token_hash")
+  userAgent String?  @map("user_agent")
+  ip        String?  @db.Inet
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([userId], map: "idx_refresh_tokens_user_id")
+  @@map("refresh_tokens")
+}
+
+/**
+ * AuthSession — temporary session created after /auth/request-otp
+ * (list side must NOT specify onDelete; child side will)
+ */
+model AuthSession {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  phone       String
+  purpose     String
+  metadata    Json?
+  clientNonce String?
+  requestIp   String?  @map("request_ip")
+  userAgent   String?  @map("user_agent")
+  expiresAt   DateTime @map("expires_at")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  phoneOtps PhoneOtp[] @relation("authsession_phone_otps")
+
+  @@index([phone, purpose], map: "idx_authsession_phone_purpose")
+  @@map("auth_sessions")
+}
+
+/**
+ * PhoneOtp — single OTP attempt, tied to sessionId
+ * Using Twilio Verify: do NOT store plaintext codes. Store provider meta instead.
+ * This is the child side of the authSession relation and can specify onDelete.
+ */
+model PhoneOtp {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+  phone   String
+  purpose String
+
+  attempts Int     @default(0)
+  used     Boolean @default(false)
+
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // Twilio provider fields
+  provider        String? @map("provider") // e.g., 'twilio'
+  providerMeta    Json?   @map("provider_meta")
+  messageSid      String? @map("message_sid")
+  verificationSid String? @map("verification_sid")
+
+  authSessionId String?      @map("auth_session_id") @db.Uuid
+  authSession   AuthSession? @relation(fields: [authSessionId], references: [id], name: "authsession_phone_otps", onDelete: Cascade)
+
+  @@index([phone, purpose], map: "idx_phoneotp_phone_purpose")
+  @@index([expiresAt], map: "idx_phoneotp_expires_at")
+  @@map("phone_otps")
 }
 
 model Upload {
