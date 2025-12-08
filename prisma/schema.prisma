@@ -168,6 +168,9 @@ model Farm {
   // sampling sessions tied to this farm
   samplingSessions SamplingSession[] @relation("farm_sampling_sessions")
 
+  currentCropId String? @map("current_crop_id") @db.Uuid
+  currentCrop   Crop?   @relation(fields: [currentCropId], references: [id], name: "farm_current_crop", onDelete: SetNull)
+
   // report backrefs (required because reports have relation fields to Farm)
   damageReports DamageReport[] @relation("farm_damage_reports")
   weeklyReports WeeklyReport[] @relation("farm_weekly_reports")
@@ -178,10 +181,11 @@ model Farm {
 }
 
 model Crop {
-  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  name      String
-  code      String?  @unique
-  createdAt DateTime @default(now()) @map("created_at")
+  id                 String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name               String
+  code               String?  @unique
+  createdAt          DateTime @default(now()) @map("created_at")
+  farmsAsCurrentCrop Farm[]   @relation("farm_current_crop")
 
   @@map("crops")
 }
