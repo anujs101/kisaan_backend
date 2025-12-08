@@ -150,7 +150,7 @@ export async function completeHandler(req: AuthRequest, res: Response, next: Nex
 
     const deviceMeta = upload.deviceMeta as any;
 
-    // Ensure required EXIF device metadata exists
+    // Ensure required device-capture metadata exists
     if (
       !deviceMeta?.captureLat ||
       !deviceMeta?.captureLon ||
@@ -183,10 +183,9 @@ export async function completeHandler(req: AuthRequest, res: Response, next: Nex
       });
     }
 
-    // Provided crop ID via farm
+    // Optional farm/crop checks (keeps your current flow)
     let providedCropId: string | null = null;
     const farmIdDeclared = deviceMeta?.farmId ?? deviceMeta?.farm_id ?? null;
-
     if (farmIdDeclared) {
       const farm = await prisma.farm.findUnique({
         where: { id: farmIdDeclared },
@@ -296,7 +295,7 @@ export async function completeHandler(req: AuthRequest, res: Response, next: Nex
       }
     }
 
-    // Create Image Record
+    // Create Image Record (unchanged)
     let image: any;
     try {
       image = await createImageRecordRaw({
@@ -346,6 +345,7 @@ export async function completeHandler(req: AuthRequest, res: Response, next: Nex
       });
     }
 
+    // set image geom (best-effort)
     try {
       await setImageGeom(imageId, exifLat, exifLon);
     } catch (e) {
@@ -357,17 +357,178 @@ export async function completeHandler(req: AuthRequest, res: Response, next: Nex
       uploadStatus: "COMPLETED",
     });
 
-    await prisma.$executeRaw`
-      UPDATE images
-      SET verification_status = ${verificationOutcome},
-          verification_reason = ${
-            verificationOutcome === "VERIFIED"
-              ? "EXIF matches device-capture"
-              : "EXIF/device mismatch"
-          },
-          verification_distance_m = ${distanceMeters}
-      WHERE id = ${imageId};
-    `;
+    // update verification columns on images table (best-effort)
+    try {
+      await prisma.$executeRaw`
+        UPDATE images
+        SET verification_status = ${verificationOutcome},
+            verification_reason = ${
+              verificationOutcome === "VERIFIED"
+                ? "EXIF matches device-capture"
+                : "EXIF/device mismatch"
+            },
+            verification_distance_m = ${distanceMeters}
+        WHERE id = ${imageId};
+      `;
+    } catch (e) {
+      console.error("Failed to write verification fields to images", e);
+    }
+
+    // === New: atomic linking using transaction + safe spatial selection ===
+    const blockStatus = verificationOutcome === "VERIFIED" ? "COMPLETED" : "FLAGGED"; // or "PENDING_REVIEW"
+
+    let linkedSessionBlockId: string | null = null;
+    let responseCode: string = "not_linked";
+
+    // safe extractor for first row
+    function firstRow<T>(rows: unknown): T | null {
+      return Array.isArray(rows) && rows.length > 0 ? (rows[0] as T) : null;
+    }
+
+    // transaction
+    await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      // 1) Try explicit sessionBlockId (if provided)
+      const explicitBlockId = (deviceMeta && (deviceMeta.sessionBlockId ?? deviceMeta.session_block_id)) as
+        | string
+        | undefined
+        | null;
+
+      if (explicitBlockId) {
+        try {
+          const explicitUpdate = await tx.$queryRaw<
+            { id: string; attempts: number }[]
+          >`
+            UPDATE sampling_session_blocks ssb
+            SET image_id = ${imageId},
+                attempts = ssb.attempts + 1,
+                status = ${blockStatus},
+                completed_at = now(),
+                capture_lat = ${deviceLat},
+                capture_lon = ${deviceLon},
+                capture_timestamp = ${deviceTs}
+            WHERE ssb.id = ${explicitBlockId}
+              AND ssb.image_id IS NULL
+            RETURNING ssb.id, ssb.attempts;
+          `;
+
+          const first = firstRow<{ id: string; attempts: number }>(explicitUpdate);
+
+          if (first) {
+            linkedSessionBlockId = first.id;
+            responseCode = verificationOutcome === "VERIFIED" ? "linked_and_verified" : "linked_but_flagged";
+
+            if (Number(first.attempts ?? 0) >= 4) {
+              await tx.$executeRaw`UPDATE sampling_session_blocks SET status = 'FAILED' WHERE id = ${explicitBlockId};`;
+            }
+
+            try {
+              await tx.auditLog.create({
+                data: {
+                  eventType: "session_block_link",
+                  userId: upload.userId ?? null,
+                  relatedId: linkedSessionBlockId,
+                  payload: {
+                    imageId,
+                    method: "explicit",
+                    verificationOutcome,
+                    distanceMeters,
+                  },
+                } as any,
+              });
+            } catch (e) {
+              console.warn("audit log insert failed", e);
+            }
+
+            return; // done
+          } else {
+            responseCode = "explicit_block_already_taken";
+          }
+        } catch (err) {
+          console.warn("explicit linking failed", err);
+          responseCode = "explicit_link_error";
+        }
+      }
+
+      // 2) Spatial fallback — safe two-step selection + atomic update
+      try {
+        // Select candidate block id with row locking (SKIP LOCKED to avoid contention)
+        const selectSql = Prisma.sql`
+          SELECT ssb.id
+          FROM sampling_session_blocks ssb
+          JOIN sampling_sessions ss ON ssb.session_id = ss.id
+          JOIN grid_blocks gb ON ssb.grid_block_id = gb.id
+          WHERE ss.status = 'ACTIVE'
+            AND ssb.image_id IS NULL
+            AND ST_Contains(gb.geom, ST_SetSRID(ST_Point(${deviceLon}, ${deviceLat}), 4326))
+            ${upload.userId ? Prisma.sql`AND ss.user_id = ${upload.userId}` : Prisma.sql``}
+          FOR UPDATE SKIP LOCKED
+          LIMIT 1
+        `;
+
+        const selectRows = await tx.$queryRawUnsafe(selectSql.text, ...selectSql.values) as { id: string }[];
+        // Note: using $queryRawUnsafe to interpolate the prepared Prisma.sql — safe because values were parameterized above.
+        const selected = firstRow<{ id: string }>(selectRows);
+
+        if (selected) {
+          const candidateId = selected.id;
+
+          // Now perform atomic update on that candidateId (only if still unlinked)
+          const updateSql = await tx.$queryRaw<
+            { id: string; attempts: number }[]
+          >`
+            UPDATE sampling_session_blocks ssb
+            SET image_id = ${imageId},
+                attempts = ssb.attempts + 1,
+                status = ${blockStatus},
+                completed_at = now(),
+                capture_lat = ${deviceLat},
+                capture_lon = ${deviceLon},
+                capture_timestamp = ${deviceTs}
+            WHERE ssb.id = ${candidateId}
+              AND ssb.image_id IS NULL
+            RETURNING ssb.id, ssb.attempts;
+          `;
+
+          const updated = firstRow<{ id: string; attempts: number }>(updateSql);
+          if (updated) {
+            linkedSessionBlockId = updated.id;
+            responseCode = verificationOutcome === "VERIFIED" ? "linked_and_verified" : "linked_but_flagged";
+
+            if (Number(updated.attempts ?? 0) >= 4) {
+              await tx.$executeRaw`UPDATE sampling_session_blocks SET status = 'FAILED' WHERE id = ${linkedSessionBlockId};`;
+            }
+
+            try {
+              await tx.auditLog.create({
+                data: {
+                  eventType: "session_block_link",
+                  userId: upload.userId ?? null,
+                  relatedId: linkedSessionBlockId,
+                  payload: {
+                    imageId,
+                    method: "spatial",
+                    verificationOutcome,
+                    distanceMeters,
+                  },
+                } as any,
+              });
+            } catch (e) {
+              console.warn("audit log insert failed", e);
+            }
+
+            return; // done
+          } else {
+            // candidate was taken between select and update (rare); treat as conflict
+            responseCode = "spatial_conflict";
+          }
+        } else {
+          responseCode = "spatial_no_match";
+        }
+      } catch (err) {
+        console.warn("spatial linking failed", err);
+        responseCode = "spatial_link_error";
+      }
+    }); // end transaction
 
     return sendJson(res, 200, {
       status: "ok",
@@ -378,6 +539,8 @@ export async function completeHandler(req: AuthRequest, res: Response, next: Nex
         distanceMeters,
         exif: { lat: exifLat, lon: exifLon, ts: exifTs },
         cloudinary: { public_id, version },
+        linkedSessionBlockId,
+        code: responseCode,
       },
     });
   } catch (err) {

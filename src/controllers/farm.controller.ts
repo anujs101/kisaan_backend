@@ -18,44 +18,48 @@ function sendJson(res: Response, status: number, body: unknown) {
  * Helper: call agro service to register polygon and return its id
  * - Requires AGRO_BASE_URL in env (throws APIError if missing)
  * - Uses AGRO_API_KEY from env if present (Authorization: Bearer)
- * - Expects response.data to contain id in one of: id, agroId, agromonitoringId
+ * - Expects response.data to contain id in one of: id, agroId, agromonitoringId, agromonitoring_id
  */
 async function registerPolygonWithAgro(geojson: Record<string, unknown>): Promise<string> {
   const base = process.env.AGRO_BASE_URL;
   if (!base) {
-    throw new APIError("Agro service base URL not configured (AGRO_BASE_URL)", 500, "AGRO_CONFIG_MISSING");
+    throw new APIError("Agro service base URL not configured", 500, "AGRO_CONFIG_MISSING");
   }
 
   const url = `${base.replace(/\/+$/, "")}/polygons`;
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
   const apiKey = process.env.AGRO_API_KEY;
+
+  // Change: Pass 'appid' as a query parameter, not a Bearer token
+  const params: Record<string, string> = {};
   if (apiKey) {
-    headers["Authorization"] = `Bearer ${apiKey}`;
+    params.appid = apiKey; 
   }
 
   try {
-    const resp = await axios.post(url, geojson, { headers, timeout: 10_000 });
-    const data = resp?.data ?? {};
+    // Pass 'params' to axios
+    const resp = await axios.post(url, geojson, { 
+      headers: { "Content-Type": "application/json" },
+      params: params, // This creates: /polygons?appid=YOUR_KEY
+      timeout: 10_000 
+    });
 
-    // Accept multiple common shapes
+    const data = resp?.data ?? {};
+    
+    // ... rest of your logic (id extraction) ...
     const agroId: unknown = data.id ?? data.agroId ?? data.agromonitoringId ?? (data?.result && data.result?.id);
 
-    if (typeof agroId === "string" && agroId.length > 0) {
-      return agroId;
-    }
+    if (typeof agroId === "string" && agroId.length > 0) return agroId;
+    if (agroId != null) return String(agroId);
 
-    // If agro returned a UUID-like value as non-string (unlikely) coerce
-    if (agroId != null) {
-      return String(agroId);
-    }
-
-    throw new APIError("Agro service returned unexpected response (missing id)", 502, "AGRO_INVALID_RESPONSE");
+    throw new APIError("Agro service returned unexpected response", 502, "AGRO_INVALID_RESPONSE");
   } catch (err: unknown) {
-    // Normalize axios errors and wrap as APIError
+    // ... your existing error handling ...
     if (axios.isAxiosError(err)) {
-      const status = err.response?.status ?? 502;
-      const msg = `Agro service call failed: ${err.message}`;
-      throw new APIError(msg, 502, "AGRO_REQUEST_FAILED", { status, body: err.response?.data ?? null });
+       const status = err.response?.status ?? 502;
+       const msg = `Agro service call failed: ${err.message}`;
+       // Log the actual response body for better debugging
+       console.error("Agro Error Body:", JSON.stringify(err.response?.data)); 
+       throw new APIError(msg, 502, "AGRO_REQUEST_FAILED", { status, body: err.response?.data ?? null });
     }
     throw err;
   }
@@ -92,9 +96,10 @@ export async function createFarmHandler(req: AuthRequest, res: Response, next: N
       throw new APIError(`Invalid polygon geometry: ${reason ?? "unknown reason"}`, 400, "INVALID_GEOMETRY");
     }
 
-    // --- NEW: register polygon with agro service and get agromonitoring id ---
+    // Register polygon with agro service and get agromonitoring id
     const agroId = await registerPolygonWithAgro(geojson);
     console.log(`Agro polygon registered with id: ${agroId}`);
+
     // Insert farm and compute center (atomic using PostGIS). Include current_crop_id and agromonitoring_id.
     const sql = `
       WITH geom AS (
@@ -144,7 +149,7 @@ export async function createFarmHandler(req: AuthRequest, res: Response, next: N
 /**
  * GET /api/farms
  * List farms belonging to the authenticated user (paginated).
- * Includes current_crop_id in results.
+ * Includes current_crop_id and agromonitoring_id in results.
  */
 export async function listFarmsHandler(req: AuthRequest, res: Response, next: NextFunction) {
   try {
@@ -178,7 +183,7 @@ export async function listFarmsHandler(req: AuthRequest, res: Response, next: Ne
 /**
  * GET /api/farms/:id
  * Return a single farm for the authenticated user.
- * Includes current_crop_id.
+ * Includes current_crop_id and agromonitoring_id.
  */
 export async function getFarmHandler(req: AuthRequest, res: Response, next: NextFunction) {
   try {

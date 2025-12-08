@@ -223,10 +223,10 @@ model Farm {
 
   // estimated yield (generic float — store units in docs; e.g., tons/ha or kg/ha)
   estimatedYield Float? @map("estimated_yield")
-
+  calculatedYield Float? @map("calculated_yield")
   // recommended per-farm grid resolution (meters)
   gridResolutionM Int? @map("grid_resolution_m")
-
+  agromonitoringId String? @map("agromonitoring_id")
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
 
@@ -429,7 +429,7 @@ model DamageReport {
   user   User?   @relation(fields: [userId], references: [id], name: "user_damage_reports", onDelete: SetNull)
 
   // Inputs / references
-  agromonitoringPolyId String?   @map("agromonitoring_poly_id")
+  agromonitoringId String? @map("agromonitoring_id")
   claimTimestamp       DateTime? @map("claim_timestamp")
 
   // ML model result
@@ -455,7 +455,7 @@ model DamageReport {
   // images referencing report are on Image.damageReportId (one-to-many from Image)
   images Image[] @relation("image_damage_report")
 
-  @@index([agromonitoringPolyId], map: "idx_damage_reports_polyid")
+  @@index([agromonitoringId], map: "idx_damage_reports_id")
   @@index([damageStatus, createdAt], map: "idx_damage_reports_status_created")
   @@map("damage_reports")
 }
