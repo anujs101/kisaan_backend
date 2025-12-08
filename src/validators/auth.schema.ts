@@ -23,13 +23,13 @@ export const purposeEnum = z.enum(["signup", "login"]);
 export const requestOtpSchema = z.object({
   phone: phoneE164,
   purpose: purposeEnum,
+
+  // Minimal optional metadata — ONLY fullName (email removed)
   metadata: z
     .object({
       fullName: z.string().max(120).optional(),
-      email: z.string().email().optional(),
     })
     .optional(),
-  clientNonce: z.string().uuid().optional(),
 });
 
 /* -------------------------------------------------------------------------- */

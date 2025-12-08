@@ -1,5 +1,6 @@
 // src/controllers/farm.controller.ts
 import type { Request, Response, NextFunction } from "express";
+import axios from "axios";
 import { prisma } from "@lib/prisma";
 import { ZodError } from "zod";
 import { createFarmSchema, updateFarmSchema } from "@validators/farm.schema";
@@ -14,9 +15,57 @@ function sendJson(res: Response, status: number, body: unknown) {
 }
 
 /**
+ * Helper: call agro service to register polygon and return its id
+ * - Requires AGRO_BASE_URL in env (throws APIError if missing)
+ * - Uses AGRO_API_KEY from env if present (Authorization: Bearer)
+ * - Expects response.data to contain id in one of: id, agroId, agromonitoringId
+ */
+async function registerPolygonWithAgro(geojson: Record<string, unknown>): Promise<string> {
+  const base = process.env.AGRO_BASE_URL;
+  if (!base) {
+    throw new APIError("Agro service base URL not configured (AGRO_BASE_URL)", 500, "AGRO_CONFIG_MISSING");
+  }
+
+  const url = `${base.replace(/\/+$/, "")}/polygons`;
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const apiKey = process.env.AGRO_API_KEY;
+  if (apiKey) {
+    headers["Authorization"] = `Bearer ${apiKey}`;
+  }
+
+  try {
+    const resp = await axios.post(url, geojson, { headers, timeout: 10_000 });
+    const data = resp?.data ?? {};
+
+    // Accept multiple common shapes
+    const agroId: unknown = data.id ?? data.agroId ?? data.agromonitoringId ?? (data?.result && data.result?.id);
+
+    if (typeof agroId === "string" && agroId.length > 0) {
+      return agroId;
+    }
+
+    // If agro returned a UUID-like value as non-string (unlikely) coerce
+    if (agroId != null) {
+      return String(agroId);
+    }
+
+    throw new APIError("Agro service returned unexpected response (missing id)", 502, "AGRO_INVALID_RESPONSE");
+  } catch (err: unknown) {
+    // Normalize axios errors and wrap as APIError
+    if (axios.isAxiosError(err)) {
+      const status = err.response?.status ?? 502;
+      const msg = `Agro service call failed: ${err.message}`;
+      throw new APIError(msg, 502, "AGRO_REQUEST_FAILED", { status, body: err.response?.data ?? null });
+    }
+    throw err;
+  }
+}
+
+/**
  * POST /api/farms
  * Create a new farm for the authenticated user.
  * Now requires cropId (validated in Zod). Verifies crop exists before inserting.
+ * Calls agro service with polygon before persisting and stores returned agromonitoring_id.
  */
 export async function createFarmHandler(req: AuthRequest, res: Response, next: NextFunction) {
   try {
@@ -43,22 +92,26 @@ export async function createFarmHandler(req: AuthRequest, res: Response, next: N
       throw new APIError(`Invalid polygon geometry: ${reason ?? "unknown reason"}`, 400, "INVALID_GEOMETRY");
     }
 
-    // Insert farm and compute center (atomic using PostGIS). Include current_crop_id.
+    // --- NEW: register polygon with agro service and get agromonitoring id ---
+    const agroId = await registerPolygonWithAgro(geojson);
+    console.log(`Agro polygon registered with id: ${agroId}`);
+    // Insert farm and compute center (atomic using PostGIS). Include current_crop_id and agromonitoring_id.
     const sql = `
       WITH geom AS (
         SELECT ST_SetSRID(ST_GeomFromGeoJSON($1::json), 4326) AS g
       ), center AS (
         SELECT ST_Centroid(g) AS c FROM geom
       )
-      INSERT INTO farms ("userId", name, address, boundary, center, center_lat, center_lon, created_at, updated_at, current_crop_id)
-      SELECT $2::uuid, $3::text, $4::text, g, c, ST_Y(c), ST_X(c), NOW(), NOW(), $5::uuid
+      INSERT INTO farms ("userId", name, address, boundary, center, center_lat, center_lon, agromonitoring_id, created_at, updated_at, current_crop_id)
+      SELECT $2::uuid, $3::text, $4::text, g, c, ST_Y(c), ST_X(c), $6::text, NOW(), NOW(), $5::uuid
       FROM geom, center
       RETURNING id, "userId", name, address,
                 ST_AsGeoJSON(boundary)::json as boundary,
                 ST_AsGeoJSON(center)::json as center,
-                center_lat, center_lon, current_crop_id, created_at, updated_at;
+                center_lat, center_lon, agromonitoring_id, current_crop_id, created_at, updated_at;
     `;
-    const raw = await prisma.$queryRawUnsafe(sql, geojsonText, userId, parsed.name, parsed.address ?? null, parsed.cropId);
+    // params: 1=geojsonText, 2=userId, 3=name, 4=address, 5=cropId, 6=agroId
+    const raw = await prisma.$queryRawUnsafe(sql, geojsonText, userId, parsed.name, parsed.address ?? null, parsed.cropId, agroId);
     const rows = Array.isArray(raw) ? (raw as any[]) : [];
     const farm = rows[0] ?? null;
 
@@ -70,7 +123,13 @@ export async function createFarmHandler(req: AuthRequest, res: Response, next: N
       eventType: "farm_created",
       userId,
       relatedId: farm.id,
-      payload: { name: farm.name ?? null, address: farm.address ?? null, currentCropId: farm.current_crop_id ?? null, cropName: crop.name ?? null },
+      payload: {
+        name: farm.name ?? null,
+        address: farm.address ?? null,
+        currentCropId: farm.current_crop_id ?? null,
+        cropName: crop.name ?? null,
+        agromonitoringId: farm.agromonitoring_id ?? agroId,
+      },
       ip: req.ip,
       userAgent: req.get("user-agent") ?? null,
     });
@@ -100,7 +159,7 @@ export async function listFarmsHandler(req: AuthRequest, res: Response, next: Ne
       SELECT id, "userId", name, address,
              ST_AsGeoJSON(boundary)::json AS boundary,
              ST_AsGeoJSON(center)::json AS center,
-             center_lat, center_lon, current_crop_id,
+             center_lat, center_lon, current_crop_id, agromonitoring_id,
              created_at, updated_at
       FROM farms
       WHERE "userId" = $1::uuid
@@ -133,7 +192,7 @@ export async function getFarmHandler(req: AuthRequest, res: Response, next: Next
       SELECT id, "userId", name, address,
              ST_AsGeoJSON(boundary)::json AS boundary,
              ST_AsGeoJSON(center)::json AS center,
-             center_lat, center_lon, current_crop_id,
+             center_lat, center_lon, current_crop_id, agromonitoring_id,
              created_at, updated_at
       FROM farms
       WHERE id = $1::uuid AND "userId" = $2::uuid
@@ -155,6 +214,9 @@ export async function getFarmHandler(req: AuthRequest, res: Response, next: Next
  * PUT /api/farms/:id
  * Update farm (boundary, name, address) — owner only.
  * Crop changes are forbidden via API.
+ *
+ * NOTE: This handler currently does NOT re-register the polygon with the agro service on boundary update.
+ * If you want update to call agro and replace agromonitoring_id when boundary changes, I can add that as a follow-up.
  */
 export async function updateFarmHandler(req: AuthRequest, res: Response, next: NextFunction) {
   try {
@@ -208,7 +270,7 @@ export async function updateFarmHandler(req: AuthRequest, res: Response, next: N
         RETURNING id, "userId", name, address,
                   ST_AsGeoJSON(boundary)::json as boundary,
                   ST_AsGeoJSON(center)::json as center,
-                  center_lat, center_lon, current_crop_id, created_at, updated_at;
+                  center_lat, center_lon, current_crop_id, agromonitoring_id, created_at, updated_at;
       `;
       const raw = await prisma.$queryRawUnsafe(updateSql, geojsonText, id, userId);
       const rows = Array.isArray(raw) ? (raw as any[]) : [];
@@ -232,7 +294,7 @@ export async function updateFarmHandler(req: AuthRequest, res: Response, next: N
           idx++;
         }
         params.push(id, userId);
-        const scalarSql = `UPDATE farms SET ${sets.join(", ")}, updated_at = NOW() WHERE id = $${idx}::uuid AND "userId" = $${idx + 1}::uuid RETURNING id, "userId", name, address, ST_AsGeoJSON(boundary)::json as boundary, ST_AsGeoJSON(center)::json as center, center_lat, center_lon, current_crop_id, created_at, updated_at;`;
+        const scalarSql = `UPDATE farms SET ${sets.join(", ")}, updated_at = NOW() WHERE id = $${idx}::uuid AND "userId" = $${idx + 1}::uuid RETURNING id, "userId", name, address, ST_AsGeoJSON(boundary)::json as boundary, ST_AsGeoJSON(center)::json as center, center_lat, center_lon, current_crop_id, agromonitoring_id, created_at, updated_at;`;
         const raw2 = await prisma.$queryRawUnsafe(scalarSql, ...params);
         const rows2 = Array.isArray(raw2) ? (raw2 as any[]) : [];
         const farm2 = rows2[0] ?? farm;
@@ -280,7 +342,7 @@ export async function updateFarmHandler(req: AuthRequest, res: Response, next: N
     }
 
     params.push(id, userId);
-    const finalSql = `UPDATE farms SET ${sets.join(", ")}, updated_at = NOW() WHERE id = $${idx}::uuid AND "userId" = $${idx + 1}::uuid RETURNING id, "userId", name, address, ST_AsGeoJSON(boundary)::json as boundary, ST_AsGeoJSON(center)::json as center, center_lat, center_lon, current_crop_id, created_at, updated_at;`;
+    const finalSql = `UPDATE farms SET ${sets.join(", ")}, updated_at = NOW() WHERE id = $${idx}::uuid AND "userId" = $${idx + 1}::uuid RETURNING id, "userId", name, address, ST_AsGeoJSON(boundary)::json as boundary, ST_AsGeoJSON(center)::json as center, center_lat, center_lon, current_crop_id, agromonitoring_id, created_at, updated_at;`;
     const finalRaw = await prisma.$queryRawUnsafe(finalSql, ...params);
     const finalRows = Array.isArray(finalRaw) ? (finalRaw as any[]) : [];
     const farm = finalRows[0] ?? null;

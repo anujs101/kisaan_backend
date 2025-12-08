@@ -1,4 +1,3 @@
-// src/controllers/auth.controller.ts
 import type { Request, Response, NextFunction } from "express";
 import bcrypt from "bcrypt";
 import { ZodError } from "zod";
@@ -31,8 +30,17 @@ function send(res: Response, status: number, body: unknown) {
   return res.status(status).json(body);
 }
 
+/**
+ * Minimal metadata shape we expect (if any) for backwards compatibility.
+ * We do NOT require email or clientNonce in the OTP request anymore.
+ */
+type SessionMeta = {
+  fullName?: string | null;
+  email?: string | null;
+};
+
 /* -------------------------------------------------------------------------- */
-/*                            REQUEST OTP (signup/login)                       */
+/*                            REQUEST OTP (signup/login)                      */
 /* -------------------------------------------------------------------------- */
 export async function requestOtpHandler(
   req: Request,
@@ -40,27 +48,29 @@ export async function requestOtpHandler(
   next: NextFunction
 ) {
   try {
+    // Request body now only requires phone + purpose (metadata optional, but email is not expected)
     const parsed = requestOtpSchema.parse(req.body);
-    const { phone: rawPhone, purpose, metadata, clientNonce } = parsed;
+    const { phone: rawPhone, purpose, metadata } = parsed;
 
     const phone = normalizePhoneToE164(rawPhone);
     if (!isE164(phone)) throw new APIError("Invalid phone number", 400);
 
-    // 10-minute session
+    // 10-minute session TTL
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
+    // Create auth session WITHOUT clientNonce (removed intentionally)
     const authSession = await prisma.authSession.create({
       data: {
         phone,
         purpose,
         metadata: metadata ?? Prisma.JsonNull,
-        clientNonce: clientNonce ?? null,
         requestIp: req.ip,
         userAgent: req.get("user-agent") ?? null,
         expiresAt
       }
     });
 
+    // Start verification with the provider (Twilio)
     const providerResp = await twilioService.startVerification(phone);
 
     await prisma.phoneOtp.create({
@@ -155,6 +165,9 @@ export async function verifyOtpHandler(
       where: { phone: session.phone }
     });
 
+    // Cast metadata safely to the minimal expected shape for backward compatibility.
+    const meta = (session.metadata as SessionMeta) ?? {};
+
     if (session.purpose === "signup") {
       if (user) {
         if (!user.phoneVerified) {
@@ -162,11 +175,10 @@ export async function verifyOtpHandler(
             where: { id: user.id },
             data: {
               phoneVerified: true,
-              fullName:
-                user.fullName ??
-                (session.metadata as any)?.fullName ??
-                null,
-              email: user.email ?? (session.metadata as any)?.email ?? null
+              // Preserve existing profile fields, only set if absent
+              fullName: user.fullName ?? meta.fullName ?? null,
+              // Note: email may exist in DB from previous flows; we do NOT expect it from OTP request.
+              email: user.email ?? meta.email ?? null
             }
           });
         }
@@ -175,9 +187,9 @@ export async function verifyOtpHandler(
           data: {
             phone: session.phone,
             phoneVerified: true,
-            email: (session.metadata as any)?.email ?? null,
+            email: meta.email ?? null,
             emailVerified: false,
-            fullName: (session.metadata as any)?.fullName ?? null
+            fullName: meta.fullName ?? null
           }
         });
       }
@@ -277,7 +289,7 @@ export async function setPasswordHandler(
 }
 
 /* -------------------------------------------------------------------------- */
-/*                           LOGIN WITH PASSWORD (phone + password)            */
+/*                           LOGIN WITH PASSWORD (phone + password)           */
 /* -------------------------------------------------------------------------- */
 export async function loginPasswordHandler(
   req: Request,
@@ -349,35 +361,27 @@ export async function refreshHandler(
     const { refreshToken } = parsed;
 
     if (!refreshToken || typeof refreshToken !== "string") {
-      // Should be caught by Zod, but extra defence in case called elsewhere
       throw new APIError("Invalid refresh token", 400, "INVALID_REFRESH_TOKEN");
     }
 
-    // rotateRefreshToken is expected to throw a clear error when token not found / expired.
-    // We catch and translate into a 401 to keep API consistent.
     let rotated;
     try {
       rotated = await rotateRefreshToken(refreshToken, req);
     } catch (err: unknown) {
-      // If the utility throws a structured APIError we forward its status/code.
       if (err instanceof APIError) return next(err);
 
-      // Common case: token not found or expired -> return 401
       const msg = (err as Error)?.message ?? "Refresh token rotation failed";
       if (/not found|expired|invalid/i.test(msg)) {
         return next(new APIError("Refresh token not found or expired", 401, "REFRESH_NOT_FOUND"));
       }
 
-      // Unknown error — rethrow to be handled by central error handler
       throw err;
     }
 
     const { refreshTokenPlain, refreshExpiresAt, userId } = rotated;
 
-    // sign a new access token (include only minimal claims here)
     const accessToken = signAccessToken({ sub: userId });
 
-    // audit the rotation
     await addAuditLog({
       eventType: "token_refreshed",
       userId,
