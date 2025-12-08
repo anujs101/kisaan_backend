@@ -18,6 +18,7 @@
 // Production-ready Prisma schema for Neon + PostGIS
 // - Set DATABASE_URL in env
 // - Note: geom uses Unsupported because Prisma doesn't have PostGIS types
+
 generator client {
   provider = "prisma-client-js"
 }
@@ -26,9 +27,17 @@ datasource db {
   provider = "postgresql"
 }
 
-// ------------------------
-// ENUMS
-// ------------------------
+/**
+ * ------------------------
+ * Enums
+ * ------------------------
+ */
+
+enum Role {
+  FARMER
+  ADMIN
+  STAFF
+}
 
 enum UploadStatus {
   PENDING
@@ -37,390 +46,856 @@ enum UploadStatus {
   PROCESSING
 }
 
-enum VerificationStatus {
+/**
+ * ML-provided status (fastapi response)
+ */
+enum DamageStatus {
   PENDING
-  VERIFIED
-  LOW_CONFIDENCE
-  UNVERIFIED
-  FLAGGED
-  REJECTED
+  VERIFIED_DAMAGE
+  NO_DAMAGE_DETECTED
+  NEGLIGIBLE_DAMAGE
+  INCONCLUSIVE
+  ERROR
 }
 
-enum ReviewStatus {
-  PENDING
+/**
+ * Admin / document verification label (what admin chooses on model output)
+ */
+enum DocVerificationStatus {
+  NOT_REVIEWED
   APPROVED
   REJECTED
+  FLAGGED
   NEEDS_MORE_INFO
 }
 
-// ------------------------
-// USER + AUTH MODELS
-// ------------------------
+/**
+ * sampling session status
+ */
+enum SessionStatus {
+  ACTIVE
+  COMPLETED
+  CANCELLED
+}
+
+/**
+ * ------------------------
+ * Core models
+ * ------------------------
+ */
 
 model User {
-  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  phone         String   @unique
+  phoneVerified Boolean  @default(false) @map("phone_verified")
+  email         String?  @unique
+  emailVerified Boolean  @default(false) @map("email_verified")
+  fullName      String?  @map("full_name")
+  role          Role?    @default(FARMER)
+  passwordHash  String?  @map("password_hash")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
 
-  phone String @unique
-  phoneVerified Boolean @default(false) @map("phone_verified")
+  uploads          Upload[]          @relation("user_uploads")
+  images           Image[]           @relation("user_images")
+  farms            Farm[]            @relation("user_farms")
+  samplingSessions SamplingSession[] @relation("user_sampling_sessions")
+  damageReports    DamageReport[]    @relation("user_damage_reports")
+  weeklyReports    WeeklyReport[]    @relation("user_weekly_reports")
+  finalReports     FinalReport[]     @relation("user_final_reports")
 
-  email String? @unique
-  emailVerified Boolean @default(false) @map("email_verified")
-
-  fullName String? @map("full_name")
-  role String?
-
-  // Local auth
-  passwordHash String? @map("password_hash")
-
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
-
-  // Relations (inverse/list sides)
-  refreshTokens RefreshToken[] @relation("user_refresh_tokens")
-  uploads Upload[] @relation("user_uploads")
-  images Image[] @relation("user_images")
-  reviews ImageReview[] @relation("user_reviews")
-  damageCases DamageCase[] @relation("user_damage_cases")
-
-  // Farms owned by this user
-  farms Farm[] @relation("user_farms")
+  // one-to-one backref to CCE (relation name must match CCE.user)
+  cce CCE? @relation("user_cce")
 
   @@map("users")
 }
 
-/*
- * Refresh tokens (child side defines relation + referential action)
- */
-model RefreshToken {
-  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+model Upload {
+  id                 String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId             String?       @db.Uuid
+  user               User?         @relation(fields: [userId], references: [id], name: "user_uploads", onDelete: SetNull)
+  localUploadId      String        @map("local_upload_id") @db.Uuid
+  filename           String?
+  filesize           BigInt?       @db.BigInt
+  hasCaptureCoords   Boolean?      @map("has_capture_coords")
+  signedParams       Json?         @map("signed_params")
+  cloudinaryPublicId String?       @map("cloudinary_public_id")
+  uploadStatus       UploadStatus? @map("upload_status")
+  deviceMeta         Json?         @map("device_meta")
+  createdAt          DateTime      @default(now()) @map("created_at")
+  updatedAt          DateTime      @updatedAt @map("updated_at")
 
-  userId String @db.Uuid
-  user User @relation(fields: [userId], references: [id], name: "user_refresh_tokens", onDelete: Cascade)
+  images Image[] @relation("upload_images")
 
-  tokenHash String @map("token_hash")
-  userAgent String? @map("user_agent")
-  ip String? @db.Inet
-  expiresAt DateTime @map("expires_at")
-  createdAt DateTime @default(now()) @map("created_at")
-
-  @@index([userId], map: "idx_refresh_tokens_user_id")
-  @@map("refresh_tokens")
+  @@unique([localUploadId], map: "ux_uploads_local_upload_id")
+  @@index([userId], map: "idx_uploads_user_id")
+  @@map("uploads")
 }
 
-/*
- * AuthSession — temporary session created after /auth/request-otp
- * (list side must NOT specify onDelete; child side will)
- */
-model AuthSession {
-  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  phone String
-  purpose String
-  metadata Json?
-  clientNonce String?
-  requestIp String? @map("request_ip")
-  userAgent String? @map("user_agent")
-  expiresAt DateTime @map("expires_at")
-  createdAt DateTime @default(now()) @map("created_at")
-
-  phoneOtps PhoneOtp[] @relation("authsession_phone_otps")
-
-  @@index([phone, purpose], map: "idx_authsession_phone_purpose")
-  @@map("auth_sessions")
-}
-
-/*
- * PhoneOtp — single OTP attempt, tied to sessionId
- * Using Twilio Verify: do NOT store plaintext codes. Store provider meta instead.
- * This is the child side of the authSession relation and can specify onDelete.
- */
-model PhoneOtp {
-  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-
-  phone String
-  purpose String
-
-  attempts Int @default(0)
-  used Boolean @default(false)
-
-  expiresAt DateTime @map("expires_at")
-  createdAt DateTime @default(now()) @map("created_at")
-
-  // Twilio provider fields
-  provider String? @map("provider") // e.g., 'twilio'
-  providerMeta Json? @map("provider_meta")
-  messageSid String? @map("message_sid")
-  verificationSid String? @map("verification_sid")
-
-  authSessionId String? @db.Uuid @map("auth_session_id")
-  authSession AuthSession? @relation(fields: [authSessionId], references: [id], name: "authsession_phone_otps", onDelete: Cascade)
-
-  @@index([phone, purpose], map: "idx_phoneotp_phone_purpose")
-  @@index([expiresAt], map: "idx_phoneotp_expires_at")
-  @@map("phone_otps")
-}
-
-// ------------------------
-// FARMS (NEW)
-// ------------------------
-
-/*
- * Farm: a farm polygon/boundary owned by a user. Each farmer can have 1..N farms.
- * We store both a geography polygon as Unsupported (PostGIS) and a convenience centroid lat/lon.
- *
- * Note: boundary and center are Unsupported because Prisma doesn't have PostGIS types.
- * We'll create actual columns & GIST indexes via raw SQL migration (see migration SQL below).
- */
 model Farm {
   id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
 
   userId String @db.Uuid
-  owner User @relation(fields: [userId], references: [id], name: "user_farms", onDelete: Cascade)
+  owner  User   @relation(fields: [userId], references: [id], name: "user_farms", onDelete: Cascade)
 
-  name String?
-  address String?          // human readable address (reverse geocode)
-  // PostGIS geometry fields
-  boundary Unsupported("geography(Polygon,4326)")?  // polygon boundary (nullable until user adds)
-  center Unsupported("geography(Point,4326)")?      // centroid point (nullable)
-  centerLat Float? @map("center_lat")
-  centerLon Float? @map("center_lon")
+  name    String?
+  address String?
+
+  // PostGIS geography fields (Unsupported in Prisma)
+  boundary  Unsupported("geography(Polygon,4326)")? // polygon boundary
+  center    Unsupported("geography(Point,4326)")? // centroid point (nullable)
+  centerLat Float?                                  @map("center_lat")
+  centerLon Float?                                  @map("center_lon")
+
+  // area in hectares (float) - store computed farm area
+  areaHa Float? @map("area_ha")
+
+  // estimated yield (generic float — store units in docs; e.g., tons/ha or kg/ha)
+  estimatedYield Float? @map("estimated_yield")
+
+  // recommended per-farm grid resolution (meters)
+  gridResolutionM Int? @map("grid_resolution_m")
 
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
 
-  images Image[] @relation("farm_images")
-  agromonitoringId String? @map("agromonitoring_id")
-  currentCropId String @map("current_crop_id") @db.Uuid
-  currentCrop   Crop   @relation(fields: [currentCropId], references: [id], name: "farm_current_crop", onDelete: Restrict)
+  // convenience backrefs / relations
+  images     Image[]     @relation("farm_images")
+  gridBlocks GridBlock[] @relation("farm_grid_blocks")
 
-  damageCases DamageCase[]
+  // sampling sessions tied to this farm
+  samplingSessions SamplingSession[] @relation("farm_sampling_sessions")
 
-  @@map("farms")
+  // report backrefs (required because reports have relation fields to Farm)
+  damageReports DamageReport[] @relation("farm_damage_reports")
+  weeklyReports WeeklyReport[] @relation("farm_weekly_reports")
+  finalReports  FinalReport[]  @relation("farm_final_reports")
+
   @@index([userId], map: "idx_farms_user_id")
-}
-
-// ------------------------
-// UPLOADS / IMAGES
-// ------------------------
-
-model Upload {
-  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-
-  userId String? @db.Uuid
-  user User? @relation(fields: [userId], references: [id], name: "user_uploads", onDelete: SetNull)
-
-  localUploadId String @db.Uuid @map("local_upload_id")
-  filename String?
-  filesize BigInt? @db.BigInt
-  hasCaptureCoords Boolean? @map("has_capture_coords")
-  signedParams Json? @map("signed_params")
-  cloudinaryPublicId String? @map("cloudinary_public_id")
-  uploadStatus UploadStatus? @map("upload_status")
-  deviceMeta Json? @map("device_meta")
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
-
-  images Image[] @relation("upload_images")
-
-  @@index([userId], map: "idx_uploads_user_id")
-  @@unique([localUploadId], map: "ux_uploads_local_upload_id")
-  @@map("uploads")
-}
-
-model Image {
-  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-
-  userId String? @db.Uuid
-  user User? @relation(fields: [userId], references: [id], name: "user_images", onDelete: SetNull)
-
-  uploadId String? @db.Uuid
-  upload Upload? @relation(fields: [uploadId], references: [id], name: "upload_images")
-
-  localUploadId String @db.Uuid @map("local_upload_id")
-  cloudinaryPublicId String @map("cloudinary_public_id")
-  storageUrl String @map("storage_url")
-  thumbnailUrl String? @map("thumbnail_url")
-
-  exif Json
-  exifLat Float? @map("exif_lat")
-  exifLon Float? @map("exif_lon")
-  exifTimestamp DateTime? @map("exif_timestamp")
-
-  captureLat Float? @map("capture_lat")
-  captureLon Float? @map("capture_lon")
-  captureTimestamp DateTime? @map("capture_timestamp")
-
-  uploadLat Float? @map("upload_lat")
-  uploadLon Float? @map("upload_lon")
-  uploadTimestamp DateTime? @map("upload_timestamp")
-
-  state String?
-  district String?
-  block String?
-  village String?
-
-  detectedCropId String? @db.Uuid @map("detected_crop_id")
-  detectedCrop Crop? @relation(fields: [detectedCropId], references: [id], name: "image_detected_crop")
-  
-  providedCropId  String? @db.Uuid @map("provided_crop_id")
-  providedCrop    Crop?   @relation("image_provided_crop", fields: [providedCropId], references: [id])
-
-
-  detectedStageId String? @db.Uuid @map("detected_stage_id")
-  detectedStage GrowthStage? @relation(fields: [detectedStageId], references: [id], name: "image_detected_stage")
-
-  qualityScore Float? @map("quality_score")
-  imageHash String? @unique @map("image_hash")
-
-  // Link image to farm (new nullable FK)
-  farmId String? @db.Uuid
-  farm Farm? @relation(fields: [farmId], references: [id], name: "farm_images", onDelete: SetNull)
-
-  geom Unsupported("geography(Point,4326)")
-
-  verificationStatus VerificationStatus @default(PENDING) @map("verification_status")
-  verificationReason String? @map("verification_reason")
-  verificationDistanceM Float? @map("verification_distance_m")
-
-  createdAt DateTime @default(now()) @map("created_at")
-
-  analytics ImageAnalytics[]
-  reviews ImageReview[]
-  damageCaseImages DamageCaseImage[]
-
-  @@index([verificationStatus, createdAt], map: "idx_images_status_created_at")
-  @@index([state, district], map: "idx_images_state_district")
-  @@index([detectedCropId], map: "idx_images_detected_crop")
-  @@unique([localUploadId], map: "ux_images_local_upload_id")
-  @@map("images")
-}
-
-model ImageAnalytics {
-  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  imageId String @db.Uuid
-  image Image @relation(fields: [imageId], references: [id])
-  modelName String? @map("model_name")
-  modelVersion String? @map("model_version")
-  results Json
-  qualityScore Float? @map("quality_score")
-  processedAt DateTime @default(now()) @map("processed_at")
-  createdAt DateTime @default(now()) @map("created_at")
-
-  @@index([imageId], map: "idx_image_analytics_image_id")
-  @@index([processedAt], map: "idx_image_analytics_processed_at")
-  @@map("image_analytics")
-}
-
-model ImageReview {
-  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  imageId String @db.Uuid
-  image Image @relation(fields: [imageId], references: [id])
-  reviewerId String? @db.Uuid
-  reviewer User? @relation(fields: [reviewerId], references: [id], name: "user_reviews")
-
-  status ReviewStatus? @map("status")
-  reason String?
-  notes String?
-  createdAt DateTime @default(now()) @map("created_at")
-
-  @@index([imageId], map: "idx_image_reviews_image_id")
-  @@index([status], map: "idx_image_reviews_status")
-  @@map("image_reviews")
+  @@map("farms")
 }
 
 model Crop {
-  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  name String
-  code String? @unique
-  seasons String[] @default([])
-  active Boolean @default(true)
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name      String
+  code      String?  @unique
   createdAt DateTime @default(now()) @map("created_at")
-
-  stages GrowthStage[] @relation("crop_stages")
-  images Image[] @relation("image_detected_crop")
-  damageCases DamageCase[] @relation("crop_damage_cases")
-  farmsAsCurrentCrop Farm[] @relation("farm_current_crop")
-  imagesProvided Image[] @relation("image_provided_crop")
-
-
 
   @@map("crops")
 }
 
-model GrowthStage {
-  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  cropId String @db.Uuid
-  crop Crop @relation(fields: [cropId], references: [id], name: "crop_stages")
-  name String?
-  stageOrder Int? @map("stage_order")
-  description String?
+/**
+ * ------------------------
+ * Simplified GridBlock
+ * ------------------------
+ */
+
+model GridBlock {
+  id     String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  farmId String @db.Uuid
+  farm   Farm   @relation(fields: [farmId], references: [id], name: "farm_grid_blocks", onDelete: Cascade)
+
+  // clipped polygon for this tile (PostGIS)
+  geom Unsupported("geography(Polygon,4326)") @map("geom")
+
+  gridResolutionM Int? @map("grid_resolution_m")
+  rowIndex        Int? @map("row_index")
+  colIndex        Int? @map("col_index")
+
   createdAt DateTime @default(now()) @map("created_at")
 
-  images Image[] @relation("image_detected_stage")
-
-  @@unique([cropId, stageOrder], map: "ux_growth_stage_crop_order")
-  @@map("growth_stages")
+  @@index([farmId], map: "idx_grid_blocks_farm_id")
+  @@map("grid_blocks")
 }
 
-model DamageCategory {
+/**
+ * ------------------------
+ * Image model (merged storage + capture)
+ * - verification fields removed (moved to DamageReport)
+ * - images have nullable FK fields to link to reports
+ * ------------------------
+ */
+
+model Image {
   id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  name String?
-  code String? @unique
-  defaultSeverity String? @map("default_severity")
+
+  // ... other fields unchanged ...
+  localUploadId      String                                @map("local_upload_id") @db.Uuid
+  userId             String?                               @db.Uuid
+  user               User?                                 @relation(fields: [userId], references: [id], name: "user_images", onDelete: SetNull)
+  farmId             String?                               @db.Uuid
+  farm               Farm?                                 @relation(fields: [farmId], references: [id], name: "farm_images", onDelete: SetNull)
+  cloudinaryPublicId String                                @map("cloudinary_public_id")
+  storageUrl         String?                               @map("storage_url")
+  thumbnailUrl       String?                               @map("thumbnail_url")
+  filesize           BigInt?                               @db.BigInt
+  exif               Json?
+  exifLat            Float?                                @map("exif_lat")
+  exifLon            Float?                                @map("exif_lon")
+  exifTimestamp      DateTime?                             @map("exif_timestamp")
+  captureLat         Float?                                @map("capture_lat")
+  captureLon         Float?                                @map("capture_lon")
+  captureTimestamp   DateTime?                             @map("capture_timestamp")
+  gridBlockId        String?                               @map("grid_block_id") @db.Uuid
+  geom               Unsupported("geography(Point,4326)")?
+  imageHash          String?                               @unique @map("image_hash")
+  uploadId           String?                               @map("upload_id") @db.Uuid
+  upload             Upload?                               @relation(fields: [uploadId], references: [id], name: "upload_images", onDelete: SetNull)
+
+  // report links
+  damageReportId String?       @map("damage_report_id") @db.Uuid
+  damageReport   DamageReport? @relation(fields: [damageReportId], references: [id], name: "image_damage_report", onDelete: SetNull)
+
+  weeklyReportId String?       @map("weekly_report_id") @db.Uuid
+  weeklyReport   WeeklyReport? @relation(fields: [weeklyReportId], references: [id], name: "image_weekly_report", onDelete: SetNull)
+
+  finalReportId String?      @map("final_report_id") @db.Uuid
+  finalReport   FinalReport? @relation(fields: [finalReportId], references: [id], name: "image_final_report", onDelete: SetNull)
+
+  // one-to-one inverse of SamplingSessionBlock.image
+  sessionBlock SamplingSessionBlock? @relation("sessionblock_image")
+
   createdAt DateTime @default(now()) @map("created_at")
 
-  @@map("damage_categories")
+  @@unique([localUploadId], map: "ux_images_local_upload_id")
+  @@index([createdAt], map: "idx_images_created_at")
+  @@index([gridBlockId], map: "idx_images_grid_block_id")
+  @@map("images")
 }
 
-model DamageCase {
+/**
+ * ------------------------
+ * SamplingSession (Option B - minimal user linkage)
+ * - createdBy scalar kept for audit (no Prisma relation to User)
+ * - farmId is required (session is farm-scoped)
+ * - Session blocks are stored in SamplingSessionBlock (one row per assigned block)
+ * ------------------------
+ */
+
+model SamplingSession {
+  id          String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sessionUuid String @unique @map("session_uuid") // client idempotency
+
+  // owner (matches User.samplingSessions)
+  userId String? @db.Uuid
+  user   User?   @relation(fields: [userId], references: [id], name: "user_sampling_sessions", onDelete: SetNull)
+
+  // farm (matches Farm.samplingSessions)
+  farmId String? @db.Uuid
+  farm   Farm?   @relation(fields: [farmId], references: [id], name: "farm_sampling_sessions", onDelete: SetNull)
+
+  // planned order — keep as JSON plan for flexibility
+  plan Json? @map("plan")
+
+  // one session -> many session blocks
+  sessionBlocks SamplingSessionBlock[] @relation("session_blocks")
+
+  status      SessionStatus @default(ACTIVE) @map("status")
+  createdAt   DateTime      @default(now()) @map("created_at")
+  completedAt DateTime?     @map("completed_at")
+
+  @@index([sessionUuid], map: "idx_sampling_sessions_uuid")
+  @@map("sampling_sessions")
+}
+
+/**
+ * ------------------------
+ * SamplingSessionBlock (one row per assigned grid block)
+ * - links back to Image when user completes
+ * ------------------------
+ */
+
+model SamplingSessionBlock {
+  id        String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sessionId String          @db.Uuid
+  session   SamplingSession @relation(fields: [sessionId], references: [id], name: "session_blocks", onDelete: Cascade)
+
+  gridBlockId       String                                  @db.Uuid
+  gridBlockGeom     Unsupported("geography(Polygon,4326)")? @map("grid_block_geom")
+  gridBlockCentroid Unsupported("geography(Point,4326)")?   @map("grid_block_centroid")
+
+  orderIndex  Int?      @map("order_index")
+  status      String    @default("PENDING")
+  attempts    Int       @default(0)
+  assignedAt  DateTime? @map("assigned_at")
+  completedAt DateTime? @map("completed_at")
+
+  // image captured for this block (nullable until provided)
+  // To make relation one-to-one, imageId must be unique on this side (the defining side).
+  imageId String? @unique @db.Uuid
+  image   Image?  @relation(fields: [imageId], references: [id], name: "sessionblock_image", onDelete: SetNull)
+
+  captureLat       Float?    @map("capture_lat")
+  captureLon       Float?    @map("capture_lon")
+  captureTimestamp DateTime? @map("capture_timestamp")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([sessionId], map: "idx_session_blocks_session_id")
+  @@index([gridBlockId], map: "idx_session_blocks_gridblock_id")
+  @@map("sampling_session_blocks")
+}
+
+/**
+ * ------------------------
+ * Damage / Weekly / Final Reports
+ * - DamageReport contains both ML result (DamageStatus) and admin doc verification (DocVerificationStatus)
+ * - NdviHistory kept for raw payload + window info
+ * ------------------------
+ */
+
+model DamageReport {
   id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  createdBy String? @db.Uuid @map("created_by")
-  createdByUser User? @relation(fields: [createdBy], references: [id], name: "user_damage_cases", onDelete: SetNull)
-  regionState String? @map("region_state")
-  regionDistrict String? @map("region_district")
-  summary String?
-  cropId String? @db.Uuid
-  crop Crop? @relation(fields: [cropId], references: [id], name: "crop_damage_cases")
-  severity String?
-  status String? @default("open")
-  estimatedAreaHa Float? @map("estimated_area_ha")
+
+  farmId String? @db.Uuid
+  farm   Farm?   @relation(fields: [farmId], references: [id], name: "farm_damage_reports", onDelete: SetNull)
+
+  userId String? @db.Uuid
+  user   User?   @relation(fields: [userId], references: [id], name: "user_damage_reports", onDelete: SetNull)
+
+  // Inputs / references
+  agromonitoringPolyId String?   @map("agromonitoring_poly_id")
+  claimTimestamp       DateTime? @map("claim_timestamp")
+
+  // ML model result
+  damageStatus            DamageStatus @default(PENDING) @map("damage_status")
+  damagePercentage        Float?       @map("damage_percentage")
+  baselineNdviAvg         Float?       @map("baseline_ndvi_avg")
+  currentNdviAvg          Float?       @map("current_ndvi_avg")
+  satelliteImagesAnalyzed Int?         @map("satellite_images_analyzed")
+
+  // Admin doc verification label (what admin chooses after review of ML output & docs)
+  docVerification DocVerificationStatus? @map("doc_verification")
+
+  // minimal run metadata
+  processedAt DateTime? @map("processed_at")
+  processedBy String?   @map("processed_by")
+
+  // raw payloads / windows for audit
+  ndviHistories NdviHistory[] @relation("report_ndvi_histories")
+
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
 
-  farmId String? @db.Uuid
-  farm Farm? @relation(fields: [farmId], references: [id], onDelete: SetNull)
-  
-  damageType String? @map("damage_type")
-  reportDetails Json? @map("report_details") // Stores the full analysis JSON
+  // images referencing report are on Image.damageReportId (one-to-many from Image)
+  images Image[] @relation("image_damage_report")
 
-  images DamageCaseImage[]
-
-  @@index([regionState, regionDistrict], map: "idx_damage_cases_region")
-  @@index([status], map: "idx_damage_cases_status")
-  @@map("damage_cases")
+  @@index([agromonitoringPolyId], map: "idx_damage_reports_polyid")
+  @@index([damageStatus, createdAt], map: "idx_damage_reports_status_created")
+  @@map("damage_reports")
 }
 
-model DamageCaseImage {
+model NdviHistory {
   id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  damageCaseId String @db.Uuid @map("damage_case_id")
-  damageCase DamageCase @relation(fields: [damageCaseId], references: [id])
-  imageId String @db.Uuid
-  image Image @relation(fields: [imageId], references: [id])
 
-  @@index([damageCaseId], map: "idx_damage_case_images_case")
-  @@map("damage_case_images")
+  damageReportId String?       @map("damage_report_id") @db.Uuid
+  damageReport   DamageReport? @relation(fields: [damageReportId], references: [id], name: "report_ndvi_histories", onDelete: Cascade)
+
+  // The raw API payload for the window (useful for audits / re-run)
+  rawPayload Json? @map("raw_payload")
+
+  // convenience aggregated fields (duplicate of what's in DamageReport for fast queries)
+  startUnix  Int? @map("start_unix")
+  endUnix    Int? @map("end_unix")
+  imageCount Int? @map("image_count")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([damageReportId], map: "idx_ndvi_histories_report_id")
+  @@map("ndvi_histories")
 }
+
+model WeeklyReport {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+  farmId String? @db.Uuid
+  farm   Farm?   @relation(fields: [farmId], references: [id], name: "farm_weekly_reports", onDelete: SetNull)
+
+  userId String? @db.Uuid
+  user   User?   @relation(fields: [userId], references: [id], name: "user_weekly_reports", onDelete: SetNull)
+
+  // Core fields
+  healthScore          Int?    @map("health_score") // 0..100 (DB CHECK recommended via raw SQL)
+  predictedGrowthStage String? @map("predicted_growth_stage")
+  farmerGrowthStage    String? @map("farmer_growth_stage")
+  recommendation       String? @map("recommendation")
+
+  // aggregated / flexible summary
+  summary Json?
+
+  // images referencing weekly report are on Image.weeklyReportId
+  images Image[] @relation("image_weekly_report")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([farmId], map: "idx_weekly_reports_farm")
+  @@map("weekly_reports")
+}
+
+model FinalReport {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+  farmId String? @db.Uuid
+  farm   Farm?   @relation(fields: [farmId], references: [id], name: "farm_final_reports", onDelete: SetNull)
+
+  userId String? @db.Uuid
+  user   User?   @relation(fields: [userId], references: [id], name: "user_final_reports", onDelete: SetNull)
+
+  harvestDate DateTime? @map("harvest_date")
+  summary     Json?
+
+  // images referencing final report are on Image.finalReportId
+  images Image[] @relation("image_final_report")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([harvestDate], map: "idx_final_reports_harvest_date")
+  @@map("final_reports")
+}
+
+/**
+ * ------------------------
+ * CCE (new table for staff metadata)
+ * - One row per staff user. userId is unique to enforce one CCE record per user.
+ * ------------------------
+ */
+
+model CCE {
+  id     String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId String @unique @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], name: "user_cce", onDelete: Cascade)
+
+  @@map("cce")
+}
+
+/**
+ * ------------------------
+ * Audit log (kept)
+ * ------------------------
+ */
 
 model AuditLog {
-  id BigInt @id @default(autoincrement()) @db.BigInt
-  eventType String @map("event_type")
-  userId String? @db.Uuid
-  relatedId String? @db.Uuid @map("related_id")
-  payload Json?
-  ip String? @db.Inet
-  userAgent String? @map("user_agent")
+  id        BigInt   @id @default(autoincrement()) @db.BigInt
+  eventType String   @map("event_type")
+  userId    String?  @db.Uuid
+  relatedId String?  @map("related_id") @db.Uuid
+  payload   Json?
+  ip        String?  @db.Inet
+  userAgent String?  @map("user_agent")
   createdAt DateTime @default(now()) @map("created_at")
 
   @@index([relatedId], map: "idx_audit_logs_related")
   @@index([createdAt], map: "idx_audit_logs_time")
   @@map("audit_logs")
 }
+
+//old schema
+// generator client {
+//   provider = "prisma-client-js"
+// }
+
+// datasource db {
+//   provider = "postgresql"
+// }
+
+// // ------------------------
+// // ENUMS
+// // ------------------------
+
+// enum UploadStatus {
+//   PENDING
+//   COMPLETED
+//   FAILED
+//   PROCESSING
+// }
+
+// enum VerificationStatus {
+//   PENDING
+//   VERIFIED
+//   LOW_CONFIDENCE
+//   UNVERIFIED
+//   FLAGGED
+//   REJECTED
+// }
+
+// enum ReviewStatus {
+//   PENDING
+//   APPROVED
+//   REJECTED
+//   NEEDS_MORE_INFO
+// }
+
+// // ------------------------
+// // USER + AUTH MODELS
+// // ------------------------
+
+// model User {
+//   id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+//   phone String @unique
+//   phoneVerified Boolean @default(false) @map("phone_verified")
+
+//   email String? @unique
+//   emailVerified Boolean @default(false) @map("email_verified")
+
+//   fullName String? @map("full_name")
+//   role String?
+
+//   // Local auth
+//   passwordHash String? @map("password_hash")
+
+//   createdAt DateTime @default(now()) @map("created_at")
+//   updatedAt DateTime @updatedAt @map("updated_at")
+
+//   // Relations (inverse/list sides)
+//   refreshTokens RefreshToken[] @relation("user_refresh_tokens")
+//   uploads Upload[] @relation("user_uploads")
+//   images Image[] @relation("user_images")
+//   reviews ImageReview[] @relation("user_reviews")
+//   damageCases DamageCase[] @relation("user_damage_cases")
+
+//   // Farms owned by this user
+//   farms Farm[] @relation("user_farms")
+
+//   @@map("users")
+// }
+
+// /*
+//  * Refresh tokens (child side defines relation + referential action)
+//  */
+// model RefreshToken {
+//   id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+//   userId String @db.Uuid
+//   user User @relation(fields: [userId], references: [id], name: "user_refresh_tokens", onDelete: Cascade)
+
+//   tokenHash String @map("token_hash")
+//   userAgent String? @map("user_agent")
+//   ip String? @db.Inet
+//   expiresAt DateTime @map("expires_at")
+//   createdAt DateTime @default(now()) @map("created_at")
+
+//   @@index([userId], map: "idx_refresh_tokens_user_id")
+//   @@map("refresh_tokens")
+// }
+
+// /*
+//  * AuthSession — temporary session created after /auth/request-otp
+//  * (list side must NOT specify onDelete; child side will)
+//  */
+// model AuthSession {
+//   id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+//   phone String
+//   purpose String
+//   metadata Json?
+//   clientNonce String?
+//   requestIp String? @map("request_ip")
+//   userAgent String? @map("user_agent")
+//   expiresAt DateTime @map("expires_at")
+//   createdAt DateTime @default(now()) @map("created_at")
+
+//   phoneOtps PhoneOtp[] @relation("authsession_phone_otps")
+
+//   @@index([phone, purpose], map: "idx_authsession_phone_purpose")
+//   @@map("auth_sessions")
+// }
+
+// /*
+//  * PhoneOtp — single OTP attempt, tied to sessionId
+//  * Using Twilio Verify: do NOT store plaintext codes. Store provider meta instead.
+//  * This is the child side of the authSession relation and can specify onDelete.
+//  */
+// model PhoneOtp {
+//   id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+//   phone String
+//   purpose String
+
+//   attempts Int @default(0)
+//   used Boolean @default(false)
+
+//   expiresAt DateTime @map("expires_at")
+//   createdAt DateTime @default(now()) @map("created_at")
+
+//   // Twilio provider fields
+//   provider String? @map("provider") // e.g., 'twilio'
+//   providerMeta Json? @map("provider_meta")
+//   messageSid String? @map("message_sid")
+//   verificationSid String? @map("verification_sid")
+
+//   authSessionId String? @db.Uuid @map("auth_session_id")
+//   authSession AuthSession? @relation(fields: [authSessionId], references: [id], name: "authsession_phone_otps", onDelete: Cascade)
+
+//   @@index([phone, purpose], map: "idx_phoneotp_phone_purpose")
+//   @@index([expiresAt], map: "idx_phoneotp_expires_at")
+//   @@map("phone_otps")
+// }
+
+// // ------------------------
+// // FARMS (NEW)
+// // ------------------------
+
+// /*
+//  * Farm: a farm polygon/boundary owned by a user. Each farmer can have 1..N farms.
+//  * We store both a geography polygon as Unsupported (PostGIS) and a convenience centroid lat/lon.
+//  *
+//  * Note: boundary and center are Unsupported because Prisma doesn't have PostGIS types.
+//  * We'll create actual columns & GIST indexes via raw SQL migration (see migration SQL below).
+//  */
+// model Farm {
+//   id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+//   userId String @db.Uuid
+//   owner User @relation(fields: [userId], references: [id], name: "user_farms", onDelete: Cascade)
+
+//   name String?
+//   address String?          // human readable address (reverse geocode)
+//   // PostGIS geometry fields
+//   boundary Unsupported("geography(Polygon,4326)")?  // polygon boundary (nullable until user adds)
+//   center Unsupported("geography(Point,4326)")?      // centroid point (nullable)
+//   centerLat Float? @map("center_lat")
+//   centerLon Float? @map("center_lon")
+
+//   createdAt DateTime @default(now()) @map("created_at")
+//   updatedAt DateTime @updatedAt @map("updated_at")
+
+//   images Image[] @relation("farm_images")
+//   agromonitoringId String? @map("agromonitoring_id")
+//   currentCropId String @map("current_crop_id") @db.Uuid
+//   currentCrop   Crop   @relation(fields: [currentCropId], references: [id], name: "farm_current_crop", onDelete: Restrict)
+
+//   damageCases DamageCase[]
+
+//   @@map("farms")
+//   @@index([userId], map: "idx_farms_user_id")
+// }
+
+// // ------------------------
+// // UPLOADS / IMAGES
+// // ------------------------
+
+// model Upload {
+//   id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+//   userId String? @db.Uuid
+//   user User? @relation(fields: [userId], references: [id], name: "user_uploads", onDelete: SetNull)
+
+//   localUploadId String @db.Uuid @map("local_upload_id")
+//   filename String?
+//   filesize BigInt? @db.BigInt
+//   hasCaptureCoords Boolean? @map("has_capture_coords")
+//   signedParams Json? @map("signed_params")
+//   cloudinaryPublicId String? @map("cloudinary_public_id")
+//   uploadStatus UploadStatus? @map("upload_status")
+//   deviceMeta Json? @map("device_meta")
+//   createdAt DateTime @default(now()) @map("created_at")
+//   updatedAt DateTime @updatedAt @map("updated_at")
+
+//   images Image[] @relation("upload_images")
+
+//   @@index([userId], map: "idx_uploads_user_id")
+//   @@unique([localUploadId], map: "ux_uploads_local_upload_id")
+//   @@map("uploads")
+// }
+
+// model Image {
+//   id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+//   userId String? @db.Uuid
+//   user User? @relation(fields: [userId], references: [id], name: "user_images", onDelete: SetNull)
+
+//   uploadId String? @db.Uuid
+//   upload Upload? @relation(fields: [uploadId], references: [id], name: "upload_images")
+
+//   localUploadId String @db.Uuid @map("local_upload_id")
+//   cloudinaryPublicId String @map("cloudinary_public_id")
+//   storageUrl String @map("storage_url")
+//   thumbnailUrl String? @map("thumbnail_url")
+
+//   exif Json
+//   exifLat Float? @map("exif_lat")
+//   exifLon Float? @map("exif_lon")
+//   exifTimestamp DateTime? @map("exif_timestamp")
+
+//   captureLat Float? @map("capture_lat")
+//   captureLon Float? @map("capture_lon")
+//   captureTimestamp DateTime? @map("capture_timestamp")
+
+//   uploadLat Float? @map("upload_lat")
+//   uploadLon Float? @map("upload_lon")
+//   uploadTimestamp DateTime? @map("upload_timestamp")
+
+//   state String?
+//   district String?
+//   block String?
+//   village String?
+
+//   detectedCropId String? @db.Uuid @map("detected_crop_id")
+//   detectedCrop Crop? @relation(fields: [detectedCropId], references: [id], name: "image_detected_crop")
+
+//   providedCropId  String? @db.Uuid @map("provided_crop_id")
+//   providedCrop    Crop?   @relation("image_provided_crop", fields: [providedCropId], references: [id])
+
+//   detectedStageId String? @db.Uuid @map("detected_stage_id")
+//   detectedStage GrowthStage? @relation(fields: [detectedStageId], references: [id], name: "image_detected_stage")
+
+//   qualityScore Float? @map("quality_score")
+//   imageHash String? @unique @map("image_hash")
+
+//   // Link image to farm (new nullable FK)
+//   farmId String? @db.Uuid
+//   farm Farm? @relation(fields: [farmId], references: [id], name: "farm_images", onDelete: SetNull)
+
+//   geom Unsupported("geography(Point,4326)")
+
+//   verificationStatus VerificationStatus @default(PENDING) @map("verification_status")
+//   verificationReason String? @map("verification_reason")
+//   verificationDistanceM Float? @map("verification_distance_m")
+
+//   createdAt DateTime @default(now()) @map("created_at")
+
+//   analytics ImageAnalytics[]
+//   reviews ImageReview[]
+//   damageCaseImages DamageCaseImage[]
+
+//   @@index([verificationStatus, createdAt], map: "idx_images_status_created_at")
+//   @@index([state, district], map: "idx_images_state_district")
+//   @@index([detectedCropId], map: "idx_images_detected_crop")
+//   @@unique([localUploadId], map: "ux_images_local_upload_id")
+//   @@map("images")
+// }
+
+// model ImageAnalytics {
+//   id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+//   imageId String @db.Uuid
+//   image Image @relation(fields: [imageId], references: [id])
+//   modelName String? @map("model_name")
+//   modelVersion String? @map("model_version")
+//   results Json
+//   qualityScore Float? @map("quality_score")
+//   processedAt DateTime @default(now()) @map("processed_at")
+//   createdAt DateTime @default(now()) @map("created_at")
+
+//   @@index([imageId], map: "idx_image_analytics_image_id")
+//   @@index([processedAt], map: "idx_image_analytics_processed_at")
+//   @@map("image_analytics")
+// }
+
+// model ImageReview {
+//   id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+//   imageId String @db.Uuid
+//   image Image @relation(fields: [imageId], references: [id])
+//   reviewerId String? @db.Uuid
+//   reviewer User? @relation(fields: [reviewerId], references: [id], name: "user_reviews")
+
+//   status ReviewStatus? @map("status")
+//   reason String?
+//   notes String?
+//   createdAt DateTime @default(now()) @map("created_at")
+
+//   @@index([imageId], map: "idx_image_reviews_image_id")
+//   @@index([status], map: "idx_image_reviews_status")
+//   @@map("image_reviews")
+// }
+
+// model Crop {
+//   id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+//   name String
+//   code String? @unique
+//   seasons String[] @default([])
+//   active Boolean @default(true)
+//   createdAt DateTime @default(now()) @map("created_at")
+
+//   stages GrowthStage[] @relation("crop_stages")
+//   images Image[] @relation("image_detected_crop")
+//   damageCases DamageCase[] @relation("crop_damage_cases")
+//   farmsAsCurrentCrop Farm[] @relation("farm_current_crop")
+//   imagesProvided Image[] @relation("image_provided_crop")
+
+//   @@map("crops")
+// }
+
+// model GrowthStage {
+//   id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+//   cropId String @db.Uuid
+//   crop Crop @relation(fields: [cropId], references: [id], name: "crop_stages")
+//   name String?
+//   stageOrder Int? @map("stage_order")
+//   description String?
+//   createdAt DateTime @default(now()) @map("created_at")
+
+//   images Image[] @relation("image_detected_stage")
+
+//   @@unique([cropId, stageOrder], map: "ux_growth_stage_crop_order")
+//   @@map("growth_stages")
+// }
+
+// model DamageCategory {
+//   id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+//   name String?
+//   code String? @unique
+//   defaultSeverity String? @map("default_severity")
+//   createdAt DateTime @default(now()) @map("created_at")
+
+//   @@map("damage_categories")
+// }
+
+// model DamageCase {
+//   id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+//   createdBy String? @db.Uuid @map("created_by")
+//   createdByUser User? @relation(fields: [createdBy], references: [id], name: "user_damage_cases", onDelete: SetNull)
+//   regionState String? @map("region_state")
+//   regionDistrict String? @map("region_district")
+//   summary String?
+//   cropId String? @db.Uuid
+//   crop Crop? @relation(fields: [cropId], references: [id], name: "crop_damage_cases")
+//   severity String?
+//   status String? @default("open")
+//   estimatedAreaHa Float? @map("estimated_area_ha")
+//   createdAt DateTime @default(now()) @map("created_at")
+//   updatedAt DateTime @updatedAt @map("updated_at")
+
+//   farmId String? @db.Uuid
+//   farm Farm? @relation(fields: [farmId], references: [id], onDelete: SetNull)
+
+//   damageType String? @map("damage_type")
+//   reportDetails Json? @map("report_details") // Stores the full analysis JSON
+
+//   images DamageCaseImage[]
+
+//   @@index([regionState, regionDistrict], map: "idx_damage_cases_region")
+//   @@index([status], map: "idx_damage_cases_status")
+//   @@map("damage_cases")
+// }
+
+// model DamageCaseImage {
+//   id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+//   damageCaseId String @db.Uuid @map("damage_case_id")
+//   damageCase DamageCase @relation(fields: [damageCaseId], references: [id])
+//   imageId String @db.Uuid
+//   image Image @relation(fields: [imageId], references: [id])
+
+//   @@index([damageCaseId], map: "idx_damage_case_images_case")
+//   @@map("damage_case_images")
+// }
+
+// model AuditLog {
+//   id BigInt @id @default(autoincrement()) @db.BigInt
+//   eventType String @map("event_type")
+//   userId String? @db.Uuid
+//   relatedId String? @db.Uuid @map("related_id")
+//   payload Json?
+//   ip String? @db.Inet
+//   userAgent String? @map("user_agent")
+//   createdAt DateTime @default(now()) @map("created_at")
+
+//   @@index([relatedId], map: "idx_audit_logs_related")
+//   @@index([createdAt], map: "idx_audit_logs_time")
+//   @@map("audit_logs")
+// }
+
+// /*farm ke andar healthscore 
+// node backend to flask api req for weekly report{agro id 
+// timestapm
+// image link array
+// }*/
