@@ -17,7 +17,7 @@ dotenv.config();
 const API_BASE = process.env.API_BASE ?? "http://localhost:4000";
 const API_ROOT = API_BASE.endsWith("/api") ? API_BASE : `${API_BASE}/api`;
 
-const PHONE = process.env.PHONE ?? "+919301783525";
+const PHONE = process.env.PHONE ?? "+917506272085";
 const PASSWORD = process.env.PASSWORD ?? "MyStrongPassw0rd!"; // using the same password as first file (hard-coded default)
 const IMAGE_PATH =
   process.env.IMAGE_PATH ??

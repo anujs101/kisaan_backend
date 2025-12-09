@@ -20,42 +20,195 @@ function sendJson(res: Response, status: number, body: unknown) {
  * - Uses AGRO_API_KEY from env if present (Authorization: Bearer)
  * - Expects response.data to contain id in one of: id, agroId, agromonitoringId
  */
-async function registerPolygonWithAgro(geojson: Record<string, unknown>): Promise<string> {
+export async function registerPolygonWithAgro(
+  geometry: Record<string, unknown>,
+  opts?: { name?: string; duplicated?: boolean; createdByUserId?: string | null }
+): Promise<string | null> {
   const base = process.env.AGRO_BASE_URL;
+  const apiKey = process.env.AGRO_API_KEY;
+
   if (!base) {
-    throw new APIError("Agro service base URL not configured (AGRO_BASE_URL)", 500, "AGRO_CONFIG_MISSING");
+    throw new APIError("Agro service base URL not configured", 500, "AGRO_CONFIG_MISSING");
+  }
+  if (!apiKey) {
+    // We allow flows when AGRO is optional — treat as configured-but-empty: skip agro.
+    await addAuditLog({
+      eventType: "agro_skip_no_key",
+      userId: opts?.createdByUserId ?? null,
+      relatedId: null,
+      payload: { reason: "AGRO_API_KEY_MISSING" },
+      ip: null,
+      userAgent: null,
+    });
+    return null;
   }
 
   const url = `${base.replace(/\/+$/, "")}/polygons`;
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  const apiKey = process.env.AGRO_API_KEY;
-  if (apiKey) {
-    headers["Authorization"] = `Bearer ${apiKey}`;
+
+  // Ensure we post a Feature in geo_json per docs
+  const geoJsonFeature =
+    (geometry && (geometry as any).type === "Feature")
+      ? geometry
+      : {
+          type: "Feature",
+          properties: {},
+          geometry,
+        };
+
+  // Compute polygon area using PostGIS (meters^2) and convert to hectares
+  try {
+    // Use a parameterized query; ST_SetSRID(ST_GeomFromGeoJSON(...),4326)::geography for accurate area
+    const payloadJson = JSON.stringify(geoJsonFeature);
+    const rows = (await prisma.$queryRaw<
+      Array<{ area: number }>
+    >`SELECT ST_Area(ST_SetSRID(ST_GeomFromGeoJSON(${payloadJson}::json), 4326)::geography) AS area;`) as Array<{ area: number }>;
+
+    const areaM2 = rows?.[0]?.area ?? null;
+    const areaHa = typeof areaM2 === "number" ? areaM2 / 10000 : null;
+
+    await addAuditLog({
+      eventType: "agro_preflight_area_check",
+      userId: opts?.createdByUserId ?? null,
+      relatedId: null,
+      payload: { areaM2, areaHa },
+      ip: null,
+      userAgent: null,
+    });
+
+    // Respect Agromonitoring documented limits: 1 - 3000 ha
+    if (areaHa === null || areaHa < 1 || areaHa > 3000) {
+      await addAuditLog({
+        eventType: "agro_skip_area_out_of_bounds",
+        userId: opts?.createdByUserId ?? null,
+        relatedId: null,
+        payload: { areaHa, reason: "AGRO_LIMITS_1_to_3000_HA" },
+        ip: null,
+        userAgent: null,
+      });
+      // Return null to indicate we intentionally skipped registering with Agro.
+      return null;
+    }
+  } catch (err: unknown) {
+    // If computing area fails, log and skip Agro instead of failing the entire flow.
+    await addAuditLog({
+      eventType: "agro_preflight_area_error",
+      userId: opts?.createdByUserId ?? null,
+      relatedId: null,
+      payload: { message: (err as Error)?.message ?? String(err) },
+      ip: null,
+      userAgent: null,
+    });
+    return null;
   }
 
+  // Build request body per Agromonitoring docs
+  const name = opts?.name ?? `Farm ${new Date().toISOString()}`;
+  const body = {
+    name,
+    geo_json: geoJsonFeature,
+  };
+
+  const params: Record<string, string> = { appid: apiKey };
+  if (opts?.duplicated) params.duplicated = "true";
+
   try {
-    const resp = await axios.post(url, geojson, { headers, timeout: 10_000 });
-    const data = resp?.data ?? {};
+    const resp = await axios.post(url, body, {
+      headers: { "Content-Type": "application/json" },
+      params,
+      timeout: 15_000,
+      validateStatus: () => true, // we will handle statuses explicitly
+    });
 
-    // Accept multiple common shapes
-    const agroId: unknown = data.id ?? data.agroId ?? data.agromonitoringId ?? (data?.result && data.result?.id);
+    if (resp.status === 201 || resp.status === 200) {
+      const data = resp.data ?? {};
+      const agroId: unknown = data.id ?? data.agroId ?? data.agromonitoringId ?? (data?.result && data.result?.id);
+      if (typeof agroId === "string" && agroId.length > 0) {
+        await addAuditLog({
+          eventType: "agro_polygon_created",
+          userId: opts?.createdByUserId ?? null,
+          relatedId: agroId,
+          payload: { name, areaReportedByAgro: data.area ?? null },
+          ip: null,
+          userAgent: null,
+        });
+        return agroId;
+      }
 
-    if (typeof agroId === "string" && agroId.length > 0) {
-      return agroId;
+      // Unexpected but 2xx response without an id
+      await addAuditLog({
+        eventType: "agro_invalid_response_no_id",
+        userId: opts?.createdByUserId ?? null,
+        relatedId: null,
+        payload: { status: resp.status, body: data },
+        ip: null,
+        userAgent: null,
+      });
+      throw new APIError("Agro service returned unexpected response (missing id)", 502, "AGRO_INVALID_RESPONSE");
     }
 
-    // If agro returned a UUID-like value as non-string (unlikely) coerce
-    if (agroId != null) {
-      return String(agroId);
+    // Handle specific known error codes
+    if (resp.status === 413) {
+      // Payload Too Large — Agro refused polygon (area / account limits)
+      await addAuditLog({
+        eventType: "agro_413_payload_too_large",
+        userId: opts?.createdByUserId ?? null,
+        relatedId: null,
+        payload: { status: resp.status, body: resp.data },
+        ip: null,
+        userAgent: null,
+      });
+      // Return null so upstream flow can continue without failing
+      return null;
     }
 
-    throw new APIError("Agro service returned unexpected response (missing id)", 502, "AGRO_INVALID_RESPONSE");
+    if (resp.status === 422) {
+      // Validation error — malformed GeoJSON etc.
+      await addAuditLog({
+        eventType: "agro_422_validation_failed",
+        userId: opts?.createdByUserId ?? null,
+        relatedId: null,
+        payload: { status: resp.status, body: resp.data },
+        ip: null,
+        userAgent: null,
+      });
+      // Bubble up as a 400-level APIError so callers can surface correction requirements
+      throw new APIError("Agro polygon validation failed", 422, "AGRO_VALIDATION_FAILED", {
+        status: resp.status,
+        body: resp.data,
+      });
+    }
+
+    // Other non-2xx responses — log and throw
+    await addAuditLog({
+      eventType: "agro_non_2xx_response",
+      userId: opts?.createdByUserId ?? null,
+      relatedId: null,
+      payload: { status: resp.status, body: resp.data },
+      ip: null,
+      userAgent: null,
+    });
+
+    throw new APIError(`Agro service call failed: HTTP ${resp.status}`, 502, "AGRO_REQUEST_FAILED", {
+      status: resp.status,
+      body: resp.data,
+    });
   } catch (err: unknown) {
-    // Normalize axios errors and wrap as APIError
+    // Axios/network error or unexpected exception
     if (axios.isAxiosError(err)) {
       const status = err.response?.status ?? 502;
-      const msg = `Agro service call failed: ${err.message}`;
-      throw new APIError(msg, 502, "AGRO_REQUEST_FAILED", { status, body: err.response?.data ?? null });
+      await addAuditLog({
+        eventType: "agro_request_error",
+        userId: opts?.createdByUserId ?? null,
+        relatedId: null,
+        payload: { message: err.message, status, body: err.response?.data ?? null },
+        ip: null,
+        userAgent: null,
+      });
+      // Wrap into APIError for consistent upstream handling
+      throw new APIError(`Agro service call failed: ${err.message}`, 502, "AGRO_REQUEST_FAILED", {
+        status,
+        body: err.response?.data ?? null,
+      });
     }
     throw err;
   }
