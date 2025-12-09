@@ -1,6 +1,5 @@
-// src/controllers/crop.controller.ts
 import type { Request, Response, NextFunction } from "express";
-import type { Crop } from "@prisma/client";
+import type { Crop, Role } from "@prisma/client";
 import { prisma } from "@lib/prisma";
 import { ZodError } from "zod";
 import { createCropSchema } from "@validators/crop.schema";
@@ -10,8 +9,9 @@ import { addAuditLog } from "@utils/audit";
 
 /**
  * AuthRequest mirrors pattern used across controllers.
+ * Note: User.role is now an enum (Role) in the new schema; keep type-safe here.
  */
-type AuthRequest = Request & { user?: { id: string; role?: string } };
+type AuthRequest = Request & { user?: { id: string; role?: Role | string } };
 
 function sendJson(res: Response, status: number, body: unknown) {
   return res.status(status).json(body);
@@ -19,8 +19,14 @@ function sendJson(res: Response, status: number, body: unknown) {
 
 /**
  * POST /api/crops
- * Create a new crop. Any authenticated user can call this endpoint (per your choice).
- * `code` is required (caller-provided) and must be unique.
+ * Create a new crop.
+ *
+ * IMPORTANT (schema migration):
+ * - New Prisma schema's Crop model only guarantees `code` as unique.
+ * - `seasons` / `active` were removed in the new schema, so we only persist
+ *   fields that exist in the new schema (name, code).
+ *
+ * Assumes createCropSchema is updated to match the new Crop shape.
  */
 export async function createCropHandler(req: AuthRequest, res: Response, next: NextFunction) {
   try {
@@ -28,25 +34,20 @@ export async function createCropHandler(req: AuthRequest, res: Response, next: N
     const userId = req.user?.id;
     if (!userId) throw new APIError("Unauthorized", 401, "UNAUTHORIZED");
 
-    // Defensive uniqueness check: prefer a user-friendly error rather than Prisma exception
-    const existing = await prisma.crop.findFirst({
-      where: {
-        OR: [{ code: parsed.code }, { name: parsed.name }],
-      },
-      select: { id: true, code: true, name: true },
+    // Defensive uniqueness check: only `code` is unique in the new schema.
+    const existing = await prisma.crop.findUnique({
+      where: { code: parsed.code },
+      select: { id: true, code: true },
     });
 
     if (existing) {
-      // If code collision or name collision -> 409
-      throw new APIError("Crop with the same code or name already exists", 409, "DUPLICATE_CROP");
+      throw new APIError("Crop with the same code already exists", 409, "DUPLICATE_CROP");
     }
 
     const crop = await prisma.crop.create({
       data: {
         name: parsed.name,
         code: parsed.code,
-        seasons: parsed.seasons ?? [],
-        active: parsed.active ?? true,
       },
     });
 
@@ -68,12 +69,12 @@ export async function createCropHandler(req: AuthRequest, res: Response, next: N
 
 /**
  * GET /api/crops
- * Simple list endpoint used by the test script / frontend dropdown.
- * Supports optional pagination via ?page & ?perPage but will return all if omitted.
+ * List crops with optional pagination.
+ *
+ * No model changes required here other than types aligning with the new schema.
  */
 export async function listCropsHandler(req: AuthRequest, res: Response, next: NextFunction) {
   try {
-    // basic pagination defaults (same style as farms)
     const page = Math.max(1, Number(req.query.page ?? 1));
     const perPage = Math.min(500, Math.max(1, Number(req.query.perPage ?? 100)));
     const offset = (page - 1) * perPage;

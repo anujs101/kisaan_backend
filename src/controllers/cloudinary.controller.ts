@@ -1,3 +1,4 @@
+// src/controllers/cloudinary.controller.ts
 import type { Request, Response, NextFunction } from "express";
 import { Prisma } from "@prisma/client";
 import { signRequestSchema, completeRequestSchema } from "@validators/upload.schema";
@@ -12,6 +13,7 @@ import {
 import { prisma } from "@lib/prisma";
 import { createImageRecordRaw } from "@services/createImageRecordRaw";
 import { normalizeExifTimestamp } from "@utils/normalizeExifTimestamp";
+import { addAuditLog } from "@utils/audit";
 
 type AuthRequest = Request & { user?: { id: string } };
 
@@ -82,7 +84,9 @@ export async function signHandler(req: AuthRequest, res: Response, next: NextFun
     });
 
     // Construct Cloudinary public_id
-    const public_id = userId ? `${userId}/${localUploadId}` : `uploads/${localUploadId}`;
+    const public_id = userId
+      ? `${userId}/${localUploadId}`
+      : `uploads/${localUploadId}`;
 
     // FINAL — Folder must be consistent across signature/client/Cloudinary
     const signedFolder = folder ?? "uploads";
@@ -147,11 +151,11 @@ export async function completeHandler(req: AuthRequest, res: Response, next: Nex
 
     const deviceMeta = upload.deviceMeta as any;
 
-    // Ensure required device-capture metadata exists
+    // Ensure required EXIF device metadata exists
     if (
-      deviceMeta?.captureLat == null ||
-      deviceMeta?.captureLon == null ||
-      deviceMeta?.captureTimestamp == null
+      !deviceMeta?.captureLat ||
+      !deviceMeta?.captureLon ||
+      !deviceMeta?.captureTimestamp
     ) {
       await updateUploadCloudMeta(localUploadId, { uploadStatus: "FAILED" });
       return sendJson(res, 400, {
@@ -180,31 +184,19 @@ export async function completeHandler(req: AuthRequest, res: Response, next: Nex
       });
     }
 
-    // Optional farm/crop checks (keeps your current flow)
+    // Provided crop ID via farm
     let providedCropId: string | null = null;
     const farmIdDeclared = deviceMeta?.farmId ?? deviceMeta?.farm_id ?? null;
+
     if (farmIdDeclared) {
       const farm = await prisma.farm.findUnique({
         where: { id: farmIdDeclared },
         select: { id: true, userId: true, currentCropId: true },
       });
 
-      if (!farm)
-        return sendJson(res, 404, {
-          status: "error",
-          error: { message: "Farm not found", code: "FARM_NOT_FOUND" },
-        });
-
-      if (farm.userId !== userId)
-        return sendJson(res, 403, {
-          status: "error",
-          error: {
-            message: "You do not own the specified farm",
-            code: "FORBIDDEN",
-          },
-        });
-
-      providedCropId = farm.currentCropId;
+      if (farm && farm.userId === userId) {
+        providedCropId = farm.currentCropId ?? null;
+      }
     }
 
     // Fetch EXIF from Cloudinary
@@ -222,9 +214,13 @@ export async function completeHandler(req: AuthRequest, res: Response, next: Nex
       });
     }
 
-    const gpsLatRaw = exif.GPSLatitude ?? exif.GPSLatitudeRef ?? null;
-    const gpsLonRaw = exif.GPSLongitude ?? exif.GPSLongitudeRef ?? null;
-    const timeRaw = exif.DateTimeOriginal ?? exif["DateTimeOriginal"] ?? exif.DateTime ?? null;
+    const gpsLatRaw = exif.GPSLatitude;
+    const gpsLonRaw = exif.GPSLongitude;
+    const timeRaw =
+      exif.DateTimeOriginal ??
+      exif["DateTimeOriginal"] ??
+      exif.DateTime ??
+      null;
 
     const exifLat = parseExifGps(gpsLatRaw);
     const exifLon = parseExifGps(gpsLonRaw);
@@ -254,10 +250,14 @@ export async function completeHandler(req: AuthRequest, res: Response, next: Nex
       });
     }
 
-    const distanceMeters = haversineDistanceMeters(deviceLat, deviceLon, exifLat, exifLon);
-
+    // Verification Logic
+    const distanceMeters = haversineDistanceMeters(
+      deviceLat,
+      deviceLon,
+      exifLat,
+      exifLon
+    );
     const tolerance = Number(process.env.VERIFICATION_TOLERANCE_METERS ?? "50");
-
     const verificationOutcome = distanceMeters <= tolerance ? "VERIFIED" : "FLAGGED";
 
     const secureUrl = (resource as any).secure_url ?? (resource as any).url ?? "";
@@ -265,25 +265,10 @@ export async function completeHandler(req: AuthRequest, res: Response, next: Nex
 
     let normalizedUploadTs: Date | null = null;
     if (parsed.uploadTimestamp) {
-      try {
-        normalizedUploadTs = normalizeExifTimestamp(parsed.uploadTimestamp);
-      } catch {
-        await updateUploadCloudMeta(localUploadId, {
-          uploadStatus: "FAILED",
-          cloudinaryPublicId: public_id,
-        });
-        return sendJson(res, 400, {
-          status: "error",
-          error: {
-            message: "uploadTimestamp invalid",
-            code: "BAD_REQUEST",
-          },
-        });
-      }
+        try { normalizedUploadTs = normalizeExifTimestamp(parsed.uploadTimestamp); } catch {}
     }
 
     // Create Image Record
-    // NOTE: remove any fields that don't exist in schema (uploadLat/uploadLon/providedCropId etc.)
     let image: any;
     try {
       image = await createImageRecordRaw({
@@ -300,8 +285,12 @@ export async function completeHandler(req: AuthRequest, res: Response, next: Nex
         captureLat: deviceLat,
         captureLon: deviceLon,
         captureTimestamp: deviceTs,
+        // Pass optional fields safely (even if ignored by SQL)
+        uploadLat: parsed.uploadLat ?? null,
+        uploadLon: parsed.uploadLon ?? null,
+        uploadTimestamp: normalizedUploadTs,
         farmId: farmIdDeclared ?? null,
-        // providedCropId intentionally NOT included because your current schema doesn't have it
+        providedCropId,
       });
     } catch (err) {
       console.error("[completeHandler] createImageRecordRaw failed", err);
@@ -319,20 +308,9 @@ export async function completeHandler(req: AuthRequest, res: Response, next: Nex
     }
 
     const imageId = (image as any)?.id;
-    if (!imageId) {
-      await updateUploadCloudMeta(localUploadId, {
-        cloudinaryPublicId: public_id,
-        uploadStatus: "FAILED",
-      });
-      return sendJson(res, 500, {
-        status: "error",
-        error: { message: "Failed to create image record", code: "INTERNAL" },
-      });
-    }
+    if (!imageId) throw new Error("Image created but ID missing");
 
-    // set image geom (best-effort)
     try {
-      // prefer exif coords for geom — setImageGeom expects (imageId, lat, lon)
       await setImageGeom(imageId, exifLat, exifLon);
     } catch (e) {
       console.error("setImageGeom failed", e);
@@ -343,179 +321,56 @@ export async function completeHandler(req: AuthRequest, res: Response, next: Nex
       uploadStatus: "COMPLETED",
     });
 
-    // NOTE: removed update of verification_status/verification_reason/verification_distance_m
-    // because those columns do not exist in your current Prisma schema.
-    // If you want to persist verification outcome, add columns to the Prisma schema and re-run migrations,
-    // or persist verification info elsewhere (e.g. in AuditLog or a separate table).
+    // ---------------------------------------------------------
+    // NEW: Link Image to Sampling Session Block
+    // ---------------------------------------------------------
+    const sessionBlockId = (deviceMeta as any)?.sessionBlockId;
+    let linkedBlockId = null;
 
-    // === Atomic linking using transaction + safe spatial selection ===
-    const blockStatus = verificationOutcome === "VERIFIED" ? "COMPLETED" : "FLAGGED";
-
-    let linkedSessionBlockId: string | null = null;
-    let responseCode: string = "not_linked";
-
-    // safe extractor for first row
-    function firstRow<T>(rows: unknown): T | null {
-      return Array.isArray(rows) && rows.length > 0 ? (rows[0] as T) : null;
+    if (sessionBlockId) {
+      try {
+        const block = await prisma.samplingSessionBlock.update({
+          where: { id: sessionBlockId },
+          data: {
+            imageId: imageId,
+            status: "COMPLETED",
+            attempts: { increment: 1 },
+            completedAt: new Date(),
+            captureLat: deviceLat,
+            captureLon: deviceLon,
+            captureTimestamp: deviceTs,
+          },
+        });
+        linkedBlockId = block.id;
+      } catch (e) {
+        console.error(`Failed to link image ${imageId} to session block ${sessionBlockId}:`, e);
+      }
     }
 
-    // transaction
-    await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-      // 1) Try explicit sessionBlockId (if provided)
-      const explicitBlockId = (deviceMeta && (deviceMeta.sessionBlockId ?? deviceMeta.session_block_id)) as
-        | string
-        | undefined
-        | null;
-
-      if (explicitBlockId) {
-        try {
-          const explicitUpdate = (await tx.$queryRaw<
-            { id: string; attempts: number }[]
-          >`
-            UPDATE sampling_session_blocks ssb
-            SET "imageId" = ${imageId},
-                attempts = ssb.attempts + 1,
-                status = ${blockStatus},
-                completed_at = now(),
-                capture_lat = ${deviceLat},
-                capture_lon = ${deviceLon},
-                capture_timestamp = ${deviceTs}
-            WHERE ssb.id = ${explicitBlockId}
-              AND ssb."imageId" IS NULL
-            RETURNING ssb.id, ssb.attempts;
-          `) as { id: string; attempts: number }[];
-
-          const first = firstRow<{ id: string; attempts: number }>(explicitUpdate);
-
-          if (first) {
-            linkedSessionBlockId = first.id;
-            responseCode = verificationOutcome === "VERIFIED" ? "linked_and_verified" : "linked_but_flagged";
-
-            if (Number(first.attempts ?? 0) >= 4) {
-              await tx.$executeRaw`UPDATE sampling_session_blocks SET status = 'FAILED' WHERE id = ${explicitBlockId};`;
-            }
-
-            try {
-              await tx.auditLog.create({
-                data: {
-                  eventType: "session_block_link",
-                  userId: upload.userId ?? null,
-                  relatedId: linkedSessionBlockId,
-                  payload: {
-                    imageId,
-                    method: "explicit",
-                    verificationOutcome,
-                    distanceMeters,
-                  },
-                } as any,
-              });
-            } catch (e) {
-              console.warn("audit log insert failed", e);
-            }
-
-            return; // done
-          } else {
-            responseCode = "explicit_block_already_taken";
-          }
-        } catch (err) {
-          console.warn("explicit linking failed", err);
-          responseCode = "explicit_link_error";
-        }
-      }
-
-      // 2) Spatial fallback — safe two-step selection + atomic update
-      try {
-        // build a parameterized Prisma.sql prepared query
-        const selectSql = Prisma.sql`
-          SELECT ssb.id
-          FROM sampling_session_blocks ssb
-          JOIN sampling_sessions ss ON ssb."sessionId" = ss.id
-          JOIN grid_blocks gb ON ssb."gridBlockId" = gb.id
-          WHERE ss.status = 'ACTIVE'
-            AND ssb."imageId" IS NULL
-            AND ST_Contains(
-              gb.geom::geometry,
-              ST_SetSRID(ST_Point(${deviceLon}, ${deviceLat})::geometry, 4326)
-            )
-            ${upload.userId ? Prisma.sql`AND ss."userId" = ${upload.userId}` : Prisma.sql``}
-          FOR UPDATE SKIP LOCKED
-          LIMIT 1
-        `;
-
-        const selectRows = (await tx.$queryRaw(selectSql)) as { id: string }[];
-        const selected = firstRow<{ id: string }>(selectRows);
-
-        if (selected) {
-          const candidateId = selected.id;
-
-          const updatedRows = (await tx.$queryRaw<
-            { id: string; attempts: number }[]
-          >`
-            UPDATE sampling_session_blocks ssb
-            SET "imageId" = ${imageId},
-                attempts = ssb.attempts + 1,
-                status = ${blockStatus},
-                completed_at = now(),
-                capture_lat = ${deviceLat},
-                capture_lon = ${deviceLon},
-                capture_timestamp = ${deviceTs}
-            WHERE ssb.id = ${candidateId}
-              AND ssb."imageId" IS NULL
-            RETURNING ssb.id, ssb.attempts;
-          `) as { id: string; attempts: number }[];
-
-          const updated = firstRow<{ id: string; attempts: number }>(updatedRows);
-          if (updated) {
-            linkedSessionBlockId = updated.id;
-            responseCode = verificationOutcome === "VERIFIED" ? "linked_and_verified" : "linked_but_flagged";
-
-            if (Number(updated.attempts ?? 0) >= 4) {
-              await tx.$executeRaw`UPDATE sampling_session_blocks SET status = 'FAILED' WHERE id = ${linkedSessionBlockId};`;
-            }
-
-            try {
-              await tx.auditLog.create({
-                data: {
-                  eventType: "session_block_link",
-                  userId: upload.userId ?? null,
-                  relatedId: linkedSessionBlockId,
-                  payload: {
-                    imageId,
-                    method: "spatial",
-                    verificationOutcome,
-                    distanceMeters,
-                  },
-                } as any,
-              });
-            } catch (e) {
-              console.warn("audit log insert failed", e);
-            }
-
-            return; // done
-          } else {
-            // candidate was taken between select and update (rare); treat as conflict
-            responseCode = "spatial_conflict";
-          }
-        } else {
-          responseCode = "spatial_no_match";
-        }
-      } catch (err) {
-        console.warn("spatial linking failed", err);
-        responseCode = "spatial_link_error";
-      }
-    }); // end transaction
+    // Audit log the verification outcome
+    await addAuditLog({
+      eventType: "image_auto_verification",
+      userId: upload.userId ?? null,
+      relatedId: imageId,
+      payload: {
+        verificationOutcome,
+        distanceMeters,
+        tolerance,
+        linkedBlockId,
+      },
+      ip: req.ip ?? null,
+      userAgent: req.get("user-agent") ?? null,
+    });
 
     return sendJson(res, 200, {
       status: "ok",
       data: {
         imageId,
-        providedCropId,
+        sessionBlockId: linkedBlockId, // Client needs to know this confirmed
         verification: verificationOutcome.toLowerCase(),
         distanceMeters,
         exif: { lat: exifLat, lon: exifLon, ts: exifTs },
         cloudinary: { public_id, version },
-        linkedSessionBlockId,
-        code: responseCode,
       },
     });
   } catch (err) {
