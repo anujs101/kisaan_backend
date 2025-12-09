@@ -1,48 +1,67 @@
-// src/services/createImageRecordRaw.ts
 import { prisma } from "@lib/prisma";
 import type { Prisma } from "@prisma/client";
+import { APIError } from "@utils/errors";
 
 /**
- * Insert an image row using raw SQL (required for PostGIS geom).
- * Uses the exact column names (mix of camelCase and snake_case) that match your Prisma schema.
+ * Insert an image row using raw SQL (PostGIS geom + explicit casts).
+ * Columns chosen to match your Prisma schema exactly (mix of snake_case and camelCase).
+ *
+ * Schema-referenced columns used here (matches your schema):
+ * - local_upload_id, cloudinary_public_id, storage_url, thumbnail_url,
+ * - exif, exif_lat, exif_lon, exif_timestamp,
+ * - capture_lat, capture_lon, capture_timestamp,
+ * - grid_block_id, geom, image_hash, upload_id,
+ * - damage_report_id, weekly_report_id, final_report_id,
+ * - userId, farmId, created_at
+ *
+ * Returns the inserted row (fields aliased to camelCase where helpful).
  */
-export async function createImageRecordRaw(input: {
-  userId: string | null;
-  uploadId: string | null;
+type Input = {
+  userId?: string | null;
+  uploadId?: string | null;
   localUploadId: string;
   cloudinaryPublicId: string;
-  storageUrl: string | null;
+  storageUrl?: string | null;
   thumbnailUrl?: string | null;
 
   exif?: Prisma.InputJsonValue | null;
-  exifLat: number;
-  exifLon: number;
-  exifTimestamp: Date;
+  exifLat?: number | null;
+  exifLon?: number | null;
+  exifTimestamp?: Date | string | null;
 
-  captureLat: number | null;
-  captureLon: number | null;
-  captureTimestamp: Date | null;
+  captureLat?: number | null;
+  captureLon?: number | null;
+  captureTimestamp?: Date | string | null;
 
-  uploadLat?: number | null;
-  uploadLon?: number | null;
-  uploadTimestamp?: Date | null;
+  gridBlockId?: string | null;
 
   farmId?: string | null;
-  providedCropId?: string | null;
-  detectedCropId?: string | null;
 
-  qualityScore?: number | null;
   imageHash?: string | null;
-}) {
-  // ensure we have coordinates for geom
-  if (input.exifLat == null || input.exifLon == null) {
-    throw new Error("exifLat and exifLon are required to set geom");
+
+  damageReportId?: string | null;
+  weeklyReportId?: string | null;
+  finalReportId?: string | null;
+};
+
+export async function createImageRecordRaw(input: Input): Promise<Record<string, unknown>> {
+  // Validation: must have coordinates (either capture or exif) to create geom per your verification rules
+  if (
+    (input.captureLat == null || input.captureLon == null) &&
+    (input.exifLat == null || input.exifLon == null)
+  ) {
+    throw new APIError("Either capture coords or EXIF coords are required to set geom", 400, "MISSING_COORDS");
   }
 
+  // prefer device-capture coords if available (enforced by your verification rules)
+  const useCapture = input.captureLat != null && input.captureLon != null;
+  const geomLat = useCapture ? input.captureLat! : input.exifLat!;
+  const geomLon = useCapture ? input.captureLon! : input.exifLon!;
+
+  // Build SQL using exact DB column names from your schema.
+  // Note: "userId" and "farmId" are camelCase in your schema and must be quoted.
   const sql = `
-    INSERT INTO images (
-      "userId",
-      "uploadId",
+    INSERT INTO public.images (
       local_upload_id,
       cloudinary_public_id,
       storage_url,
@@ -57,119 +76,146 @@ export async function createImageRecordRaw(input: {
       capture_lon,
       capture_timestamp,
 
-      upload_lat,
-      upload_lon,
-      upload_timestamp,
+      grid_block_id,
 
+      -- userId and farmId are camelCase in the schema (no @map), so quote them
+      "userId",
       "farmId",
-      provided_crop_id,
-      detected_crop_id,
 
-      quality_score,
       image_hash,
+      upload_id,
+
+      damage_report_id,
+      weekly_report_id,
+      final_report_id,
 
       geom,
       created_at
     )
     VALUES (
-      $1::uuid,
-      $2::uuid,
-      $3::uuid,
-      $4::text,
-      $5::text,
-      $6::text,
+      $1::uuid,    -- local_upload_id
+      $2::text,    -- cloudinary_public_id
+      $3::text,    -- storage_url
+      $4::text,    -- thumbnail_url
 
-      $7::json,
-      $8::double precision,
-      $9::double precision,
-      $10::timestamptz,
+      $5::json,    -- exif
+      $6::double precision, -- exif_lat
+      $7::double precision, -- exif_lon
+      $8::timestamptz,      -- exif_timestamp
 
-      $11::double precision,
-      $12::double precision,
-      $13::timestamptz,
+      $9::double precision,  -- capture_lat
+      $10::double precision, -- capture_lon
+      $11::timestamptz,      -- capture_timestamp
 
-      $14::double precision,
-      $15::double precision,
-      $16::timestamptz,
+      $12::uuid,   -- grid_block_id
 
-      $17::uuid,
-      $18::uuid,
-      $19::uuid,
+      $13::uuid,   -- "userId"
+      $14::uuid,   -- "farmId"
 
-      $20::double precision,
-      $21::text,
+      $15::text,   -- image_hash
+      $16::uuid,   -- upload_id
 
-      ST_SetSRID(ST_MakePoint($9::double precision, $8::double precision), 4326)::geography,
+      $17::uuid,   -- damage_report_id
+      $18::uuid,   -- weekly_report_id
+      $19::uuid,   -- final_report_id
+
+      ST_SetSRID(ST_MakePoint($20::double precision, $21::double precision), 4326)::geography, -- geom (lon, lat)
       NOW()
     )
     RETURNING
       id,
-      "userId" AS "userId",
-      "uploadId" AS "uploadId",
-      local_upload_id AS "localUploadId",
+      local_upload_id    AS "localUploadId",
       cloudinary_public_id AS "cloudinaryPublicId",
-      storage_url AS "storageUrl",
-      thumbnail_url AS "thumbnailUrl",
+      storage_url        AS "storageUrl",
+      thumbnail_url      AS "thumbnailUrl",
 
       exif,
-      exif_lat AS "exifLat",
-      exif_lon AS "exifLon",
-      exif_timestamp AS "exifTimestamp",
+      exif_lat           AS "exifLat",
+      exif_lon           AS "exifLon",
+      exif_timestamp     AS "exifTimestamp",
 
-      capture_lat AS "captureLat",
-      capture_lon AS "captureLon",
-      capture_timestamp AS "captureTimestamp",
+      capture_lat        AS "captureLat",
+      capture_lon        AS "captureLon",
+      capture_timestamp  AS "captureTimestamp",
 
-      upload_lat AS "uploadLat",
-      upload_lon AS "uploadLon",
-      upload_timestamp AS "uploadTimestamp",
+      grid_block_id      AS "gridBlockId",
 
-      "farmId" AS "farmId",
-      provided_crop_id AS "providedCropId",
-      detected_crop_id AS "detectedCropId",
+      "userId"           AS "userId",
+      "farmId"           AS "farmId",
 
-      quality_score AS "qualityScore",
-      image_hash AS "imageHash",
+      image_hash         AS "imageHash",
+      upload_id          AS "uploadId",
 
+      damage_report_id   AS "damageReportId",
+      weekly_report_id   AS "weeklyReportId",
+      final_report_id    AS "finalReportId",
+
+      -- return geom as GeoJSON JSON so Prisma can deserialize it
       ST_AsGeoJSON(geom)::json AS geom,
-      verification_status AS "verificationStatus",
-      verification_reason AS "verificationReason",
-      verification_distance_m AS "verificationDistanceM",
-      created_at AS "createdAt";
+
+      created_at         AS "createdAt";
   `;
 
+  // Prepare parameters in the exact same order used above
   const params = [
-    input.userId, // $1
-    input.uploadId, // $2
-    input.localUploadId, // $3
-    input.cloudinaryPublicId, // $4
-    input.storageUrl, // $5
-    input.thumbnailUrl ?? null, // $6
+    input.localUploadId, // $1
+    input.cloudinaryPublicId, // $2
+    input.storageUrl ?? null, // $3
+    input.thumbnailUrl ?? null, // $4
 
-    input.exif ?? null, // $7
-    input.exifLat, // $8
-    input.exifLon, // $9
-    input.exifTimestamp, // $10
+    input.exif ? JSON.stringify(input.exif) : null, // $5
+    input.exifLat ?? null, // $6
+    input.exifLon ?? null, // $7
+    input.exifTimestamp ? new Date(input.exifTimestamp) : null, // $8
 
-    input.captureLat ?? null, // $11
-    input.captureLon ?? null, // $12
-    input.captureTimestamp ?? null, // $13
+    input.captureLat ?? null, // $9
+    input.captureLon ?? null, // $10
+    input.captureTimestamp ? new Date(input.captureTimestamp) : null, // $11
 
-    input.uploadLat ?? null, // $14
-    input.uploadLon ?? null, // $15
-    input.uploadTimestamp ?? null, // $16
+    input.gridBlockId ?? null, // $12
 
-    input.farmId ?? null, // $17
-    input.providedCropId ?? null, // $18
-    input.detectedCropId ?? null, // $19
+    input.userId ?? null, // $13
+    input.farmId ?? null, // $14
 
-    input.qualityScore ?? null, // $20
-    input.imageHash ?? null, // $21
+    input.imageHash ?? null, // $15
+    input.uploadId ?? null, // $16
+
+    input.damageReportId ?? null, // $17
+    input.weeklyReportId ?? null, // $18
+    input.finalReportId ?? null, // $19
+
+    geomLon, // $20
+    geomLat, // $21
   ];
 
-  const raw = await prisma.$queryRawUnsafe(sql, ...params);
-  const rows = Array.isArray(raw) ? (raw as any[]) : [];
-  const created = rows[0] ?? null;
-  if (!created) throw new Error("Failed to insert image record");
-  return created;
+  try {
+    // We interpolate a fixed SQL string (no dynamic identifiers) and pass params separately to avoid injection
+    const raw = (await prisma.$queryRawUnsafe(sql, ...params)) as any[];
+
+    if (!Array.isArray(raw) || raw.length === 0) {
+      throw new APIError("Failed to insert image record (no rows returned)", 500, "CREATE_IMAGE_FAILED");
+    }
+
+    const created = raw[0];
+
+    // ensure geom is parsed object if returned as string
+    if (created && typeof created.geom === "string") {
+      try {
+        created.geom = JSON.parse(created.geom);
+      } catch {
+        // leave as-is if parsing fails
+      }
+    }
+
+    return created;
+  } catch (err: unknown) {
+    const e = err as any;
+    // Very likely reasons: column mismatch / missing column in DB / permission / constraint violation
+    throw new APIError(
+      `createImageRecordRaw failed: ${e?.message ?? String(e)}`,
+      500,
+      "CREATE_IMAGE_RAW_FAILED",
+      { original: e }
+    );
+  }
 }
