@@ -5,6 +5,7 @@ import { startWeeklySessionSchema, submitWeeklySessionSchema } from "@validators
 import { createSamplingSession, fetchSessionFull } from "@services/sampling.service";
 import { addAuditLog } from "@utils/audit";
 import { APIError } from "@utils/errors";
+import * as MLService from "@services/ml.service"; // Import the ML service
 
 type AuthRequest = Request & { user?: { id: string } };
 
@@ -87,7 +88,7 @@ export async function getSessionHandler(req: AuthRequest, res: Response, next: N
 
 /**
  * POST /api/farms/:farmId/weekly-sessions/:sessionUuid/submit
- * Finalizes the session and creates a WeeklyReport.
+ * Finalizes the session, runs ML analysis (Growth & Disease), and creates a WeeklyReport.
  */
 export async function submitSessionHandler(req: AuthRequest, res: Response, next: NextFunction) {
   try {
@@ -124,7 +125,6 @@ export async function submitSessionHandler(req: AuthRequest, res: Response, next
             userId,
             farmerGrowthStage: body.farmerGrowthStage,
             summary: body.notes ? { notes: body.notes } : undefined,
-            // healthScore, predictedGrowthStage etc. will be filled by async ML jobs
         }
     });
 
@@ -140,6 +140,68 @@ export async function submitSessionHandler(req: AuthRequest, res: Response, next
         data: { status: "COMPLETED", completedAt: new Date() }
     });
 
+    // --- AI INTEGRATION START ---
+    // Fetch images including the current crop for the farm to help the ML models
+    const images = await prisma.image.findMany({
+      where: { id: { in: imageIds } },
+      include: { farm: { include: { currentCrop: true } } }
+    });
+
+    // Run ML models for each image in parallel
+    // FIX: Added ': any' to img to resolve TS7006 implicit any error
+    const analysisResults = await Promise.all(images.map(async (img: any) => {
+        const cropName = img.farm?.currentCrop?.name || "Wheat";
+        const storageUrl = img.storageUrl;
+
+        if (!storageUrl) return { growth: null, disease: null };
+
+        // Parallel calls: Growth (Endpoint 2) & Disease (Endpoint 3)
+        const [growth, disease] = await Promise.all([
+            MLService.verifyGrowthStage(storageUrl, cropName, body.farmerGrowthStage || "Vegetative"),
+            MLService.detectDisease(storageUrl, cropName)
+        ]);
+
+        // Save raw analysis to the specific Image record
+        await prisma.image.update({
+            where: { id: img.id },
+            data: {
+                aiAnalysis: {
+                    growth_verification: growth, 
+                    disease_detection: disease   
+                }
+            }
+        });
+
+        return { growth, disease };
+    }));
+
+    // Aggregate findings for the Weekly Report Summary
+
+    // 1. Gather all diseases found (excluding "Healthy" or "None")
+    const diseasesFound = analysisResults
+      .map(r => r.disease)
+      .filter(d => d && d.predicted_disease && d.predicted_disease.toLowerCase() !== "healthy" && d.predicted_disease.toLowerCase() !== "none");
+
+    // 2. Determine the "Mode" (most frequent) Growth Stage
+    const stages = analysisResults
+        .map(r => r.growth?.predicted_growth_stage)
+        .filter(Boolean) as string[];
+    
+    // Sort logic to find the most common occurrence
+    const modeStage = stages.sort((a,b) =>
+        stages.filter(v => v===a).length - stages.filter(v => v===b).length
+    ).pop();
+
+    // Update the Report with aggregated AI insights
+    await prisma.weeklyReport.update({
+      where: { id: report.id },
+      data: {
+        aiDiseaseSummary: diseasesFound.length > 0 ? diseasesFound : undefined,
+        predictedGrowthStage: modeStage
+      }
+    });
+    // --- AI INTEGRATION END ---
+
     await addAuditLog({
         eventType: "weekly_session_submitted",
         userId,
@@ -148,9 +210,6 @@ export async function submitSessionHandler(req: AuthRequest, res: Response, next
         ip: req.ip,
         userAgent: req.get("user-agent")
     });
-
-    // 4. (Optional) Trigger Weekly Analysis Job here
-    console.log(`[JOB] Enqueuing Weekly Analysis for Report ${report.id}`);
 
     return sendJson(res, 200, {
         status: "ok",

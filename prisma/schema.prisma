@@ -330,6 +330,10 @@ model Image {
   // one-to-one inverse of SamplingSessionBlock.image
   sessionBlock SamplingSessionBlock? @relation("sessionblock_image")
 
+  // --- AI INTEGRATION FIELDS ---
+  // Stores raw analysis from ML (Crop, Growth, Disease, Damage)
+  aiAnalysis    Json?    @map("ai_analysis")
+
   createdAt DateTime @default(now()) @map("created_at")
 
   @@unique([localUploadId], map: "ux_images_local_upload_id")
@@ -439,6 +443,10 @@ model DamageReport {
   currentNdviAvg          Float?       @map("current_ndvi_avg")
   satelliteImagesAnalyzed Int?         @map("satellite_images_analyzed")
 
+  // --- AI INTEGRATION FIELDS ---
+  // The dominant damage type detected by AI across all images (e.g. "pest", "water stress")
+  aiDamageType  String?  @map("ai_damage_type")
+
   // Admin doc verification label (what admin chooses after review of ML output & docs)
   docVerification DocVerificationStatus? @map("doc_verification")
 
@@ -497,6 +505,10 @@ model WeeklyReport {
 
   // aggregated / flexible summary
   summary Json?
+
+  // --- AI INTEGRATION FIELDS ---
+  // Aggregated list of diseases detected (e.g. [{ disease: "Leaf Rust", count: 2 }])
+  aiDiseaseSummary Json? @map("ai_disease_summary")
 
   // images referencing weekly report are on Image.weeklyReportId
   images Image[] @relation("image_weekly_report")

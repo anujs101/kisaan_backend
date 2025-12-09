@@ -4,6 +4,8 @@ import { prisma } from "@lib/prisma";
 import { startSessionSchema, submitSessionSchema } from "@validators/damage.schema";
 import { createSamplingSession, fetchSessionFull } from "@services/sampling.service";
 import { addAuditLog } from "@utils/audit";
+import { APIError } from "@utils/errors";
+import * as MLService from "@services/ml.service"; // Import ML Service
 
 type AuthRequest = Request & { user?: { id: string } };
 
@@ -21,7 +23,7 @@ export async function startSessionHandler(req: AuthRequest, res: Response, next:
     const body = startSessionSchema.parse(req.body);
 
     if (!farmId) {
-        return sendJson(res, 400, { status: "error", error: { message: "Farm ID is required" } });
+        throw new APIError("Farm ID is required", 400);
     }
 
     const farm = await prisma.farm.findUnique({
@@ -30,7 +32,7 @@ export async function startSessionHandler(req: AuthRequest, res: Response, next:
     });
 
     if (!farm || farm.userId !== userId) {
-        return sendJson(res, 403, { status: "error", error: { message: "Farm not found or access denied" } });
+        throw new APIError("Farm not found or access denied", 403);
     }
 
     const resM = farm.gridResolutionM ?? body.gridResolutionM ?? 50;
@@ -67,7 +69,7 @@ export async function getSessionHandler(req: AuthRequest, res: Response, next: N
     });
 
     if (!session || session.farmId !== farmId) {
-        return sendJson(res, 404, { status: "error", error: { message: "Session not found" } });
+        throw new APIError("Session not found", 404);
     }
     
     const fullSession = await fetchSessionFull(session.id);
@@ -95,62 +97,117 @@ export async function submitSessionHandler(req: AuthRequest, res: Response, next
     });
 
     if (!session || session.farmId !== farmId) {
-        return sendJson(res, 404, { status: "error", error: { message: "Session not found" } });
+        throw new APIError("Session not found", 404);
     }
 
     if (session.status !== 'ACTIVE') {
-        return sendJson(res, 400, { status: "error", error: { message: `Session is already ${session.status}` } });
+        throw new APIError(`Session is already ${session.status}`, 400);
     }
 
-    // FIX: Explicitly type 'b' as 'any' to resolve TS7006 error
     const completedBlocks = session.sessionBlocks.filter((b: any) => b.status === 'COMPLETED' && b.imageId);
     
     if (completedBlocks.length === 0) {
-        return sendJson(res, 400, { status: "error", error: { message: "No completed blocks found. Cannot submit empty session." } });
+        throw new APIError("No completed blocks found.", 400);
     }
 
     const imageIds = completedBlocks.map((b: any) => b.imageId!);
 
-    // 2. Create Damage Report
+    // --- AI INTEGRATION START ---
+    
+    // 1. Satellite Damage Calculation (Endpoint 5)
+    // Needs: poly_id, claim_date (Unix)
+    const farm = await prisma.farm.findUnique({ 
+        where: { id: farmId },
+        include: { currentCrop: true } 
+    });
+    
+    let satelliteResult = null;
+    if (farm?.agromonitoringId) {
+       const claimDateUnix = Math.floor(Date.now() / 1000);
+       satelliteResult = await MLService.calculateSatelliteDamage(farm.agromonitoringId, claimDateUnix);
+    }
+
+    // 2. Create Damage Report (With Satellite Data)
     const report = await prisma.damageReport.create({
         data: {
             farmId,
             userId,
             damageStatus: "PENDING",
             claimTimestamp: new Date(),
-            processedBy: "system_submit",
+            processedBy: "system_ml",
+            
+            // Map Endpoint 5 response fields
+            damagePercentage: satelliteResult?.damage_percentage,
+            baselineNdviAvg: satelliteResult?.details?.baseline_ndvi_avg,
+            currentNdviAvg: satelliteResult?.details?.current_ndvi_avg,
+            satelliteImagesAnalyzed: satelliteResult?.details?.satellite_images_analyzed,
         }
     });
 
-    // 3. Link Images to Report
-    await prisma.image.updateMany({
-        where: { id: { in: imageIds } },
-        data: { damageReportId: report.id }
-    });
+    // 3. Link Images & Close Session
+    await prisma.image.updateMany({ where: { id: { in: imageIds } }, data: { damageReportId: report.id } });
+    await prisma.samplingSession.update({ where: { id: session.id }, data: { status: "COMPLETED", completedAt: new Date() } });
 
-    // 4. Mark Session Completed
-    await prisma.samplingSession.update({
-        where: { id: session.id },
-        data: { status: "COMPLETED", completedAt: new Date() }
-    });
+    // 4. Analyze Images Visuals (Endpoint 1 & 4)
+    const images = await prisma.image.findMany({ where: { id: { in: imageIds } } });
+    const cropName = farm?.currentCrop?.name || "Wheat"; 
+    const damageReasons: string[] = [];
+
+    await Promise.all(images.map(async (img: any) => {
+        if (!img.storageUrl) return;
+
+        const [cropCheck, visualDamage] = await Promise.all([
+            // Endpoint 1: Verify Crop
+            MLService.verifyCrop(img.storageUrl, cropName),
+            // Endpoint 4: Assess Damage
+            MLService.assessVisualDamage(img.storageUrl, cropName)
+        ]);
+
+        if (visualDamage?.predicted_reason) {
+            damageReasons.push(visualDamage.predicted_reason);
+        }
+
+        // Update Image
+        await prisma.image.update({
+            where: { id: img.id },
+            data: {
+                aiAnalysis: {
+                    crop_verification: cropCheck, // { predicted_name, match, confidence }
+                    visual_damage: visualDamage   // { predicted_reason, match, confidence }
+                }
+            }
+        });
+    }));
+
+    // 5. Update Report with Consensus Damage Type
+    // If multiple images show "pest", we tag the report as "pest"
+    if (damageReasons.length > 0) {
+        const modeReason = damageReasons.sort((a,b) =>
+          damageReasons.filter(v => v===a).length - damageReasons.filter(v => v===b).length
+        ).pop();
+
+        await prisma.damageReport.update({
+            where: { id: report.id },
+            data: { aiDamageType: modeReason }
+        });
+    }
+    // --- AI INTEGRATION END ---
 
     await addAuditLog({
         eventType: "session_submitted",
         userId,
         relatedId: report.id,
-        payload: { sessionId: session.id, imageCount: imageIds.length },
+        payload: { sessionId: session.id, imageCount: imageIds.length, satResult: !!satelliteResult },
         ip: req.ip,
         userAgent: req.get("user-agent")
     });
-
-    // 5. Enqueue ML Job (Mock)
-    console.log(`[ML-JOB] Enqueuing report ${report.id} for images: ${imageIds.join(', ')}`);
 
     return sendJson(res, 200, {
         status: "ok",
         data: {
             damageReportId: report.id,
-            damageStatus: "PENDING"
+            damageStatus: "PENDING",
+            satelliteData: satelliteResult 
         }
     });
 
